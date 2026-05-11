@@ -1340,7 +1340,7 @@ static void qqeScheduleModelCacheSaveLocked(void) {
     gQQEModelAntiRecallSaveScheduled = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        @synchronized (gQQEModelAntiRecallDisk ?: [NSObject class]) {
+        @synchronized (gQQEModelAntiRecallDisk ?: (id)[NSObject class]) {
             gQQEModelAntiRecallSaveScheduled = NO;
             if (!gQQEModelAntiRecallDiskLoaded) return;
             [gQQEModelAntiRecallDisk writeToFile:qqeModelCachePath() atomically:YES];
@@ -1882,8 +1882,8 @@ static void qqesignInstallRecallHooksWithRetry(void) {
 #pragma mark - 6. 网络层防撤回 (SSLRead Hook)
 // ─────────────────────────────────────────────
 
-typedef OSStatus (*SSLReadFunc)(void *, void *, size_t, size_t *);
-static SSLReadFunc orig_SSLRead = NULL;
+typedef OSStatus (*QQESSLReadFunc)(void *, void *, size_t, size_t *);
+static QQESSLReadFunc orig_SSLRead = NULL;
 
 static OSStatus hooked_SSLRead(void *context, void *data, size_t dataLength, size_t *processed) {
     OSStatus ret = orig_SSLRead(context, data, dataLength, processed);
