@@ -2,3 +2,5 @@
 dist/
 *.ipa
 .DS_Store
+frida_research/
+.venv/
