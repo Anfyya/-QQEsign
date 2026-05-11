@@ -1,4 +1,4 @@
-name: Build QQESign dylib
+name: Build QQESign deb and dylib
 
 on:
   push:
@@ -35,8 +35,9 @@ jobs:
           tar -xJf iPhoneOS16.5.sdk.tar.xz
           rm -f iPhoneOS16.5.sdk.tar.xz
 
-      - name: Install ldid
-        run: brew install ldid || true
+      - name: Install packaging tools
+        run: |
+          brew install ldid dpkg || true
 
       - name: Build dylib (Logos + clang, no Theos tweak.mk)
         run: |
@@ -45,30 +46,24 @@ jobs:
           SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDKROOT"
 
-          # Step 1: Logos preprocess (.x -> .m)
-          # %config(generator=internal) is in source file — ensures internal generator
           LOGOS=$(find "$THEOS" -name "logos.pl" -path "*/bin/*" | head -1)
           echo "Using Logos: $LOGOS"
           perl "$LOGOS" Tweak.x > Tweak.x.m
           echo "=== Logos preprocessing done ==="
 
-          # Verify: internal generator should NOT produce MSHookMessageEx calls
           if grep -q 'MSHookMessageEx\|MSHookFunction\|HBLogDebug' Tweak.x.m; then
             echo "ERROR: Logos output contains Substrate calls! Generator=internal not working"
-            echo "--- checking for substrate references ---"
             grep -n 'MSHook\|substrate\|Substrate' Tweak.x.m || true
             exit 1
           fi
           echo "OK: no Substrate references in preprocessed code"
 
-          # Verify: should contain objc runtime calls (proof internal generator worked)
           if grep -q 'method_setImplementation\|class_getInstanceMethod' Tweak.x.m; then
             echo "OK: internal generator produced ObjC runtime hooks"
           else
             echo "WARNING: no ObjC runtime hook calls found, hooks may not work"
           fi
 
-          # Step 2: Compile + link dylib directly (zero substrate dependency)
           xcrun -sdk iphoneos clang -arch arm64 \
             -miphoneos-version-min=10.0 \
             -isysroot "$SDKROOT" \
@@ -84,31 +79,58 @@ jobs:
       - name: Verify dylib
         run: |
           set -e
-          echo "=== file ==="
           file QQESign.dylib
-          echo "=== lipo ==="
           lipo -info QQESign.dylib
-          echo "=== otool -L (dependencies) ==="
           otool -L QQESign.dylib
-          echo "=== check no substrate ==="
           if otool -L QQESign.dylib | grep -i substrate; then
             echo "ERROR: dylib links against CydiaSubstrate!"
             exit 1
           fi
           echo "OK: no substrate dependency"
 
-      - name: Collect artifacts
+      - name: Build deb package
         run: |
           set -e
-          mkdir -p dist
-          cp QQESign.dylib dist/
+          rm -rf package dist
+          mkdir -p package/DEBIAN package/Library/MobileSubstrate/DynamicLibraries dist
+          cp QQESign.dylib package/Library/MobileSubstrate/DynamicLibraries/QQESign.dylib
+          cat > package/Library/MobileSubstrate/DynamicLibraries/QQESign.plist <<'PLIST'
+          {
+            Filter = {
+              Bundles = (
+                "com.tencent.mqq"
+              );
+            };
+          }
+          PLIST
+          cat > package/DEBIAN/control <<'CTRL'
+          Package: com.qqesign.tweak
+          Name: QQESign
+          Version: 1.0.${{ github.run_number }}
+          Architecture: iphoneos-arm64
+          Description: QQESign tweak for QQ NT
+          Maintainer: Anfyya
+          Author: Anfyya
+          Section: Tweaks
+          Depends: firmware (>= 10.0)
+          CTRL
+          dpkg-deb --build package QQESign.deb
+          cp QQESign.dylib dist/QQESign.dylib
+          cp QQESign.deb dist/QQESign.deb
           ls -la dist/
 
-      - name: Upload artifact
+      - name: Upload dylib artifact
         uses: actions/upload-artifact@v4
         with:
-          name: QQESign-arm64
+          name: QQESign-dylib-arm64
           path: dist/QQESign.dylib
+          if-no-files-found: error
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QQESign-deb-arm64
+          path: dist/QQESign.deb
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -118,10 +140,12 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: QQESign v1.0.${{ github.run_number }}
           body: |
-            QQESign arm64 dylib
+            QQESign arm64 dylib and deb package
 
             Commit: ${{ github.sha }}
-          files: dist/QQESign.dylib
+          files: |
+            dist/QQESign.dylib
+            dist/QQESign.deb
           draft: false
           prerelease: false
         env:
