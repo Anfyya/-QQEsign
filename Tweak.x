@@ -369,7 +369,7 @@ typedef struct {
     IMP orig;
 } QQESignRecallHookRecord;
 
-static QQESignRecallHookRecord gQQESignRecallHooks[48];
+static QQESignRecallHookRecord gQQESignRecallHooks[64];
 static NSUInteger gQQESignRecallHookCount = 0;
 
 typedef BOOL (*QQEOrigBoolRecallNetParse)(id, SEL, const void *, int, int, void *);
@@ -387,6 +387,9 @@ typedef void (*QQEOrigVoidOneObjBool)(id, SEL, id, BOOL);
 typedef void (*QQEOrigVoidGrayTip)(id, SEL, id, id, id, unsigned int);
 typedef void (*QQEOrigVoidMsgRecall3)(id, SEL, int, id, unsigned long long);
 typedef void (*QQEOrigVoidGuildPush)(id, SEL, long long, long long, long long, int, id, id, id, id, int);
+typedef id   (*QQEOrigIdGrayTipElementInit)(id, SEL, NSInteger, id, id, id, id, id, id, id, id, id, id, id, id, id, id);
+
+static NSUInteger gQQESignRecallGrayTipElementBlockedCount = 0;
 
 typedef struct {
     const char *className;
@@ -969,6 +972,56 @@ static void qqesignRecallGrayTipBlocker(id self,
     if (orig) orig(self, _cmd, model, vc, contact, busiId);
 }
 
+static id qqesignRecallGrayTipElementInitBlocker(id self,
+                                                 SEL _cmd,
+                                                 NSInteger subElementType,
+                                                 id revokeElement,
+                                                 id proclamationElement,
+                                                 id emojiReplyElement,
+                                                 id groupElement,
+                                                 id buddyElement,
+                                                 id feedMsgElement,
+                                                 id essenceElement,
+                                                 id xmlElement,
+                                                 id fileReceiptElement,
+                                                 id localGrayTipElement,
+                                                 id blockGrayTipElement,
+                                                 id aioOpGrayTipElement,
+                                                 id jsonGrayTipElement,
+                                                 id walletGrayTipElement) {
+    if (pref_antiRevoke && revokeElement) {
+        gQQESignRecallGrayTipElementBlockedCount++;
+        if (gQQESignRecallGrayTipElementBlockedCount <= 8 ||
+            (gQQESignRecallGrayTipElementBlockedCount % 50) == 0) {
+            NSLog(@"[QQESign] 拦截 NTQQ 撤回灰条构造 #%lu: -[%@ %@] subType=%ld",
+                  (unsigned long)gQQESignRecallGrayTipElementBlockedCount,
+                  NSStringFromClass([self class]),
+                  NSStringFromSelector(_cmd),
+                  (long)subElementType);
+        }
+        return nil;
+    }
+
+    QQEOrigIdGrayTipElementInit orig = (QQEOrigIdGrayTipElementInit)qqesignLookupRecallOriginal(self, _cmd);
+    return orig ? orig(self,
+                       _cmd,
+                       subElementType,
+                       revokeElement,
+                       proclamationElement,
+                       emojiReplyElement,
+                       groupElement,
+                       buddyElement,
+                       feedMsgElement,
+                       essenceElement,
+                       xmlElement,
+                       fileReceiptElement,
+                       localGrayTipElement,
+                       blockGrayTipElement,
+                       aioOpGrayTipElement,
+                       jsonGrayTipElement,
+                       walletGrayTipElement) : nil;
+}
+
 static void qqesignRecallMsgRecall3Blocker(id self, SEL _cmd, int arg1, id arg2, unsigned long long arg3) {
     if (pref_antiRevoke) {
         NSLog(@"[QQESign] 拦截撤回入口: -[%@ %@]", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
@@ -1108,6 +1161,8 @@ static NSUInteger qqesignInstallRecallHooksPass(const char *reason) {
             // UI 灰条兜底
             { "NTAIOGrayTipsOtherLinkRecallHandle", "grayTipsEventWithModel:curVC:contact:busiId:",
               "v44@0:8@16@24@32I40", (IMP)qqesignRecallGrayTipBlocker, "gray-tip" },
+            { "OCGrayTipElement", "initWithSubElementType:revokeElement:proclamationElement:emojiReplyElement:groupElement:buddyElement:feedMsgElement:essenceElement:xmlElement:fileReceiptElement:localGrayTipElement:blockGrayTipElement:aioOpGrayTipElement:jsonGrayTipElement:walletGrayTipElement:",
+              NULL, (IMP)qqesignRecallGrayTipElementInitBlocker, "gray-tip-revoke-element" },
             { "NSNotificationCenter", "postNotification:",
               "v24@0:8@16", (IMP)qqesignRecallNotifPostOneBlocker, "notif-post-1" },
             { "NSNotificationCenter", "postNotificationName:object:",
@@ -1327,6 +1382,48 @@ static void qqesignInstallRecallHooksWithRetry(void) {
 %end
 
 // ─────────────────────────────────────────────
+#pragma mark - 6. 网络层防撤回 (SSLRead Hook)
+// ─────────────────────────────────────────────
+
+typedef OSStatus (*SSLReadFunc)(void *, void *, size_t, size_t *);
+static SSLReadFunc orig_SSLRead = NULL;
+
+static OSStatus hooked_SSLRead(void *context, void *data, size_t dataLength, size_t *processed) {
+    OSStatus ret = orig_SSLRead(context, data, dataLength, processed);
+    if (ret == noErr && processed && *processed > 0 && pref_antiRevoke) {
+        uint8_t *buf = (uint8_t *)data;
+        size_t n = *processed;
+        for (size_t i = 0; i + 3 < n; i++) {
+            if (buf[i] == 0x08) {
+                uint32_t cmd = 0; int shift = 0; size_t j = i + 1;
+                while (j < n && (buf[j] & 0x80) && shift < 28) { cmd |= (uint32_t)(buf[j] & 0x7F) << shift; shift += 7; j++; }
+                if (j < n) cmd |= (uint32_t)(buf[j] & 0x7F) << shift;
+                if (cmd == 0x210 || cmd == 0x211) {
+                    QQELog(@"🔒 SSLRead拦截撤回 cmd=0x%X sz=%zu", cmd, n);
+                    memset(buf, 0, n); *processed = 0; return errSSLClosedNoNotify;
+                }
+            }
+            if (n - i >= 6 && (memcmp(buf + i, "recall", 6) == 0 || memcmp(buf + i, "revoke", 6) == 0 || memcmp(buf + i, "Recall", 6) == 0)) {
+                QQELog(@"🔒 SSLRead拦截撤回文本 sz=%zu", n);
+                memset(buf, 0, n); *processed = 0; return errSSLClosedNoNotify;
+            }
+        }
+    }
+    return ret;
+}
+
+static void qqesign_installNetworkHooks(void) {
+    if (!qqesignResolveInlineHookBackend()) { QQELog(@"⚠️ 网络层未安装:Dobby不可用"); return; }
+    void *h = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { QQELog(@"⚠️ Security.framework加载失败"); return; }
+    void *sslRead = dlsym(h, "SSLRead");
+    if (!sslRead) { QQELog(@"⚠️ SSLRead符号未找到"); dlclose(h); return; }
+    int rc = gQQEDobbyHook(sslRead, (void *)hooked_SSLRead, (void **)&orig_SSLRead);
+    if (rc == 0) QQELog(@"✅ SSLRead Hook已安装 %p", sslRead);
+    else QQELog(@"❌ SSLRead Hook失败 rc=%d", rc);
+}
+
+// ─────────────────────────────────────────────
 #pragma mark - Constructor
 // ─────────────────────────────────────────────
 
@@ -1335,6 +1432,7 @@ static void qqesignInstallRecallHooksWithRetry(void) {
         loadPrefs();
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallRecallHooksWithRetry();
+        qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
         NSLog(@"[QQESign] v2.0 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d flashSave=%d fakeDevice=%d fakeBatt=%d",
               pref_antiRevoke, pref_flashUnlimited, pref_flashSave,
               pref_fakeDevice, pref_fakeBattery);
