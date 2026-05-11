@@ -1,6 +1,6 @@
 
 // QQESign — 免越狱轻松签版 (NT架构)
-// 防撤回 / 闪照无限查看 / 模拟 iPhone 17 Pro Max + 电量
+// 防撤回持久化 / 闪照无限查看 / 自定义电量
 // Target: com.tencent.mqq (arm64) — sideload injection
 
 %config(generator=internal)
@@ -44,7 +44,6 @@ static NSString *const kPrefSuite = @"com.qqesign.prefs";
 
 static BOOL   pref_antiRevoke     = YES;
 static BOOL   pref_flashUnlimited = YES;
-static BOOL   pref_fakeDevice     = NO;
 static BOOL   pref_fakeBattery    = NO;
 static float  pref_batteryLevel   = 0.80f;
 static BOOL   pref_isCharging     = NO;
@@ -57,7 +56,6 @@ static NSUserDefaults *tweakDefaults(void) {
         [ud registerDefaults:@{
             @"antiRevoke":     @YES,
             @"flashUnlimited": @YES,
-            @"fakeDevice":     @NO,
             @"fakeBattery":    @NO,
             @"batteryLevel":   @0.80f,
             @"isCharging":     @NO,
@@ -66,11 +64,12 @@ static NSUserDefaults *tweakDefaults(void) {
     return ud;
 }
 
+static void qqesignClearModelAntiRecallRuntimeCache(void);
+
 static void loadPrefs(void) {
     NSUserDefaults *ud = tweakDefaults();
     pref_antiRevoke     = [ud boolForKey:@"antiRevoke"];
     pref_flashUnlimited = [ud boolForKey:@"flashUnlimited"];
-    pref_fakeDevice     = [ud boolForKey:@"fakeDevice"];
     pref_fakeBattery    = [ud boolForKey:@"fakeBattery"];
     pref_batteryLevel   = [ud floatForKey:@"batteryLevel"];
     pref_isCharging     = [ud boolForKey:@"isCharging"];
@@ -206,17 +205,16 @@ static UIWindow *activeForegroundWindow(void) {
 }
 
 - (void)rebuildSections {
-    _sectionTitles = @[@"消息防撤回", @"闪照设置", @"设备模拟", @"自定义电量", @"关于"];
+    _sectionTitles = @[@"消息防撤回", @"闪照设置", @"自定义电量", @"关于"];
     _sections = @[
         @[@{@"title": @"开启防撤回", @"key": @"antiRevoke", @"type": @"switch"}],
         @[@{@"title": @"无限次查看闪照", @"key": @"flashUnlimited", @"type": @"switch"}],
-        @[@{@"title": @"模拟 iPhone 17 Pro Max", @"key": @"fakeDevice", @"type": @"switch"}],
         @[
             @{@"title": @"启用自定义电量", @"key": @"fakeBattery", @"type": @"switch"},
             @{@"title": @"电量 (0~100)", @"key": @"batteryLevel", @"type": @"number"},
             @{@"title": @"模拟充电中", @"key": @"isCharging", @"type": @"switch"},
         ],
-        @[@{@"title": @"QQESign v2.1\n适配NT架构 · 防撤回 · 闪照无限查看\n模拟 iPhone 17 Pro Max 与电量", @"type": @"info"}],
+        @[@{@"title": @"QQESign v2.2\n适配NT架构 · 防撤回持久化 · 闪照无限查看\n自定义电量", @"type": @"info"}],
     ];
 }
 
@@ -294,9 +292,14 @@ static UIWindow *activeForegroundWindow(void) {
 
 - (void)switchChanged:(UISwitch *)sw {
     NSDictionary *item = _sections[sw.tag / 100][sw.tag % 100];
-    [tweakDefaults() setBool:sw.on forKey:item[@"key"]];
+    NSString *key = item[@"key"];
+    [tweakDefaults() setBool:sw.on forKey:key];
     [tweakDefaults() synchronize];
     loadPrefs();
+    if ([key isEqualToString:@"antiRevoke"] && !sw.on) {
+        qqesignClearModelAntiRecallRuntimeCache();
+        QQELog(@"[QQESign] 防撤回开关关闭：运行缓存和持久化缓存已清空，后续撤回放行");
+    }
 }
 
 @end
@@ -331,6 +334,299 @@ static void addESignButton(UIViewController *vc, SEL action) {
     vc.navigationItem.rightBarButtonItems = items;
 }
 
+
+
+#pragma mark - 0.5 Model anti-recall persistent cache
+
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *gQQEModelAntiRecallRuntime = nil;
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *gQQEModelAntiRecallDisk = nil;
+static dispatch_queue_t gQQEModelAntiRecallPersistQueue = nil;
+static const NSUInteger kQQEModelAntiRecallMaxItems = 1000;
+
+static NSString *qqeModelCachePath(void) {
+    static NSString *path = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *base = dirs.firstObject ?: NSTemporaryDirectory();
+        path = [base stringByAppendingPathComponent:@"qqesign_antirevoke_model_cache.plist"];
+    });
+    return path;
+}
+
+static void qqeEnsureModelCacheLoaded(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gQQEModelAntiRecallRuntime = [NSMutableDictionary dictionary];
+        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:qqeModelCachePath()];
+        gQQEModelAntiRecallDisk = disk ? [disk mutableCopy] : [NSMutableDictionary dictionary];
+        gQQEModelAntiRecallPersistQueue = dispatch_queue_create("com.qqesign.antirecall.persist", DISPATCH_QUEUE_SERIAL);
+        QQELog(@"[QQESign] 防撤回持久化缓存加载：%lu 条", (unsigned long)gQQEModelAntiRecallDisk.count);
+    });
+}
+
+static void qqePersistModelCacheAsync(void) {
+    qqeEnsureModelCacheLoaded();
+    NSDictionary *snapshot = nil;
+    @synchronized (gQQEModelAntiRecallDisk) {
+        snapshot = [gQQEModelAntiRecallDisk copy];
+    }
+    dispatch_async(gQQEModelAntiRecallPersistQueue, ^{
+        [snapshot writeToFile:qqeModelCachePath() atomically:YES];
+    });
+}
+
+static void qqeTrimModelCacheLocked(void) {
+    if (gQQEModelAntiRecallDisk.count <= kQQEModelAntiRecallMaxItems) return;
+    NSArray<NSString *> *keys = [gQQEModelAntiRecallDisk keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSTimeInterval ta = [a[@"ts"] doubleValue];
+        NSTimeInterval tb = [b[@"ts"] doubleValue];
+        if (ta < tb) return NSOrderedAscending;
+        if (ta > tb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    NSUInteger removeCount = gQQEModelAntiRecallDisk.count - kQQEModelAntiRecallMaxItems;
+    for (NSUInteger i = 0; i < removeCount && i < keys.count; i++) {
+        [gQQEModelAntiRecallDisk removeObjectForKey:keys[i]];
+        [gQQEModelAntiRecallRuntime removeObjectForKey:keys[i]];
+    }
+}
+
+static Ivar qqeFindIvar(Class cls, const char *name) {
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        Ivar iv = class_getInstanceVariable(c, name);
+        if (iv) return iv;
+    }
+    return NULL;
+}
+
+static id qqeObjectIvar(id obj, const char *name) {
+    if (!obj || !name) return nil;
+    Ivar iv = qqeFindIvar([obj class], name);
+    if (!iv) return nil;
+    const char *type = ivar_getTypeEncoding(iv);
+    if (!type || type[0] != '@') return nil;
+    @try { return object_getIvar(obj, iv); } @catch (__unused NSException *e) { return nil; }
+}
+
+static long long qqeIntegerIvar(id obj, const char *name) {
+    if (!obj || !name) return 0;
+    Ivar iv = qqeFindIvar([obj class], name);
+    if (!iv) return 0;
+    const char *type = ivar_getTypeEncoding(iv);
+    ptrdiff_t off = ivar_getOffset(iv);
+    uint8_t *base = (uint8_t *)(__bridge void *)obj;
+    if (!type) return 0;
+    switch (type[0]) {
+        case 'q': return *(long long *)(base + off);
+        case 'Q': return (long long)*(unsigned long long *)(base + off);
+        case 'l': return *(long *)(base + off);
+        case 'L': return (long long)*(unsigned long *)(base + off);
+        case 'i': return *(int *)(base + off);
+        case 'I': return (long long)*(unsigned int *)(base + off);
+        case 's': return *(short *)(base + off);
+        case 'S': return (long long)*(unsigned short *)(base + off);
+        case 'c': return *(char *)(base + off);
+        case 'C': return (long long)*(unsigned char *)(base + off);
+        case 'B': return *(BOOL *)(base + off);
+        default: return 0;
+    }
+}
+
+static void qqeSetIntegerIvar(id obj, const char *name, long long value) {
+    if (!obj || !name) return;
+    Ivar iv = qqeFindIvar([obj class], name);
+    if (!iv) return;
+    const char *type = ivar_getTypeEncoding(iv);
+    ptrdiff_t off = ivar_getOffset(iv);
+    uint8_t *base = (uint8_t *)(__bridge void *)obj;
+    if (!type) return;
+    switch (type[0]) {
+        case 'q': *(long long *)(base + off) = value; break;
+        case 'Q': *(unsigned long long *)(base + off) = (unsigned long long)value; break;
+        case 'l': *(long *)(base + off) = (long)value; break;
+        case 'L': *(unsigned long *)(base + off) = (unsigned long)value; break;
+        case 'i': *(int *)(base + off) = (int)value; break;
+        case 'I': *(unsigned int *)(base + off) = (unsigned int)value; break;
+        case 's': *(short *)(base + off) = (short)value; break;
+        case 'S': *(unsigned short *)(base + off) = (unsigned short)value; break;
+        case 'c': *(char *)(base + off) = (char)value; break;
+        case 'C': *(unsigned char *)(base + off) = (unsigned char)value; break;
+        case 'B': *(BOOL *)(base + off) = (BOOL)value; break;
+        default: break;
+    }
+}
+
+static void qqeSetObjectIvar(id obj, const char *name, id value) {
+    if (!obj || !name) return;
+    Ivar iv = qqeFindIvar([obj class], name);
+    if (!iv) return;
+    const char *type = ivar_getTypeEncoding(iv);
+    if (!type || type[0] != '@') return;
+    @try { object_setIvar(obj, iv, value); } @catch (__unused NSException *e) {}
+}
+
+static NSString *qqeSafeString(id obj) {
+    if (!obj) return @"";
+    if ([obj isKindOfClass:[NSString class]]) return obj;
+    return [obj description] ?: @"";
+}
+
+static NSString *qqeRecordKeyForModelAntiRecall(id record) {
+    if (!record) return nil;
+    NSString *peer = qqeSafeString(qqeObjectIvar(record, "_peerUid"));
+    NSString *sender = qqeSafeString(qqeObjectIvar(record, "_senderUid"));
+    long long msgId = qqeIntegerIvar(record, "_msgId");
+    long long msgRandom = qqeIntegerIvar(record, "_msgRandom");
+    long long msgSeq = qqeIntegerIvar(record, "_msgSeq");
+    long long msgTime = qqeIntegerIvar(record, "_msgTime");
+    if (msgId == 0 || msgRandom == 0) return nil;
+    return [NSString stringWithFormat:@"peer=%@|sender=%@|id=%lld|random=%lld|seq=%lld|time=%lld", peer, sender, msgId, msgRandom, msgSeq, msgTime];
+}
+
+static BOOL qqeIsRecallModelRecord(id record) {
+    return qqeIntegerIvar(record, "_msgType") == 5 && qqeIntegerIvar(record, "_subMsgType") == 4;
+}
+
+static BOOL qqeIsCacheableModelRecord(id record, id elements) {
+    if (!record || !elements || qqeIsRecallModelRecord(record)) return NO;
+    if (qqeIntegerIvar(record, "_msgId") == 0 || qqeIntegerIvar(record, "_msgRandom") == 0) return NO;
+    if (![elements respondsToSelector:@selector(count)]) return NO;
+    NSUInteger count = 0;
+    @try { count = (NSUInteger)[elements count]; } @catch (__unused NSException *e) { count = 0; }
+    return count > 0 && count < 80;
+}
+
+static NSData *qqeArchiveElements(id elements) {
+    if (!elements) return nil;
+    @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        return [NSKeyedArchiver archivedDataWithRootObject:elements];
+#pragma clang diagnostic pop
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static id qqeUnarchiveElements(NSData *data) {
+    if (![data isKindOfClass:[NSData class]] || data.length == 0) return nil;
+    @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        return [NSKeyedUnarchiver unarchiveObjectWithData:data];
+#pragma clang diagnostic pop
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static void qqeCacheModelRecord(id record, id elements) {
+    if (!pref_antiRevoke || !qqeIsCacheableModelRecord(record, elements)) return;
+    NSString *key = qqeRecordKeyForModelAntiRecall(record);
+    if (key.length == 0) return;
+    qqeEnsureModelCacheLoaded();
+
+    NSData *data = qqeArchiveElements(elements);
+    NSNumber *msgType = @(qqeIntegerIvar(record, "_msgType"));
+    NSNumber *subMsgType = @(qqeIntegerIvar(record, "_subMsgType"));
+    NSNumber *ts = @([[NSDate date] timeIntervalSince1970]);
+
+    NSMutableDictionary *runtimeEntry = [NSMutableDictionary dictionary];
+    runtimeEntry[@"elements"] = elements;
+    if (data) runtimeEntry[@"data"] = data;
+    runtimeEntry[@"msgType"] = msgType;
+    runtimeEntry[@"subMsgType"] = subMsgType;
+    runtimeEntry[@"ts"] = ts;
+
+    @synchronized (gQQEModelAntiRecallDisk) {
+        gQQEModelAntiRecallRuntime[key] = runtimeEntry;
+        if (data) {
+            NSMutableDictionary *diskEntry = [NSMutableDictionary dictionary];
+            diskEntry[@"data"] = data;
+            diskEntry[@"msgType"] = msgType;
+            diskEntry[@"subMsgType"] = subMsgType;
+            diskEntry[@"ts"] = ts;
+            gQQEModelAntiRecallDisk[key] = diskEntry;
+        }
+        qqeTrimModelCacheLocked();
+    }
+    if (data) qqePersistModelCacheAsync();
+}
+
+static NSMutableDictionary *qqeLookupModelRecord(NSString *key) {
+    if (key.length == 0) return nil;
+    qqeEnsureModelCacheLoaded();
+    @synchronized (gQQEModelAntiRecallDisk) {
+        NSMutableDictionary *runtime = gQQEModelAntiRecallRuntime[key];
+        if (runtime[@"elements"]) return runtime;
+
+        NSDictionary *disk = gQQEModelAntiRecallDisk[key];
+        NSData *data = disk[@"data"];
+        id elements = qqeUnarchiveElements(data);
+        if (!elements) return nil;
+        NSMutableDictionary *entry = [disk mutableCopy];
+        entry[@"elements"] = elements;
+        gQQEModelAntiRecallRuntime[key] = entry;
+        return entry;
+    }
+}
+
+static BOOL qqeRestoreModelRecord(id record, NSMutableDictionary *entry) {
+    if (!record || !entry) return NO;
+    id elements = entry[@"elements"];
+    if (!elements) return NO;
+    qqeSetIntegerIvar(record, "_msgType", [entry[@"msgType"] longLongValue]);
+    qqeSetIntegerIvar(record, "_subMsgType", [entry[@"subMsgType"] longLongValue]);
+    qqeSetIntegerIvar(record, "_recallTime", 0);
+    qqeSetObjectIvar(record, "_msgEventInfo", nil);
+    qqeSetObjectIvar(record, "_elements", elements);
+    return YES;
+}
+
+static void qqesignClearModelAntiRecallRuntimeCache(void) {
+    qqeEnsureModelCacheLoaded();
+    @synchronized (gQQEModelAntiRecallDisk) {
+        [gQQEModelAntiRecallRuntime removeAllObjects];
+        [gQQEModelAntiRecallDisk removeAllObjects];
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:qqeModelCachePath() error:nil];
+}
+
+%hook OCMsgRecord
+
+- (void)setElements:(id)elements {
+    if (pref_antiRevoke) {
+        if (qqeIsCacheableModelRecord(self, elements)) {
+            qqeCacheModelRecord(self, elements);
+        } else if (qqeIsRecallModelRecord(self)) {
+            NSString *key = qqeRecordKeyForModelAntiRecall(self);
+            NSMutableDictionary *entry = qqeLookupModelRecord(key);
+            if (entry && qqeRestoreModelRecord(self, entry)) {
+                QQELog(@"[QQESign] 模型层防撤回恢复 elements: %@", key);
+                id restoredElements = entry[@"elements"];
+                %orig(restoredElements);
+                return;
+            }
+        }
+    }
+    %orig(elements);
+}
+
+- (void)setRecallTime:(long long)recallTime {
+    if (pref_antiRevoke && recallTime != 0) {
+        NSString *key = qqeRecordKeyForModelAntiRecall(self);
+        NSMutableDictionary *entry = qqeLookupModelRecord(key);
+        if (entry && qqeRestoreModelRecord(self, entry)) {
+            QQELog(@"[QQESign] 模型层防撤回清除 recallTime: %@", key);
+            %orig(0);
+            return;
+        }
+    }
+    %orig(recallTime);
+}
+
+%end
 
 #pragma mark - 1. Anti-recall runtime hooks (NT QQ)
 
@@ -1298,78 +1594,10 @@ static void qqesignInstallRecallHooksWithRetry(void) {
 %end
 
 // ─────────────────────────────────────────────
-#pragma mark - 4. 设备模拟 / 电量
+#pragma mark - 4. 自定义电量
 // ─────────────────────────────────────────────
 
-static NSString *const kQQEiPhone17PMName = @"iPhone 17 Pro Max";
-static NSString *const kQQEiPhone17PMIdentifier = @"iPhone18,2";
-static NSString *const kQQEiPhone17PMEnc1 = @"iPhone18%2C2";
-static NSString *const kQQEiPhone17PMEnc2 = @"iPhone18%252C2";
-
-static BOOL qqeShouldPatchDeviceKey(id key) {
-    return pref_fakeDevice &&
-           [key isKindOfClass:[NSString class]] &&
-           ([(NSString *)key isEqualToString:@"model"] ||
-            [(NSString *)key isEqualToString:@"modelIdentifier"]);
-}
-
-static NSString *qqePatchIPhone17ProMaxString(NSString *value) {
-    if (!pref_fakeDevice || ![value isKindOfClass:[NSString class]] || value.length == 0) return value;
-
-    NSString *v = value;
-    v = [v stringByReplacingOccurrencesOfString:@"model=iPad8%252C9" withString:@"model=iPhone18%252C2"];
-    v = [v stringByReplacingOccurrencesOfString:@"modelIdentifier=iPad8%252C9" withString:@"modelIdentifier=iPhone18%252C2"];
-    v = [v stringByReplacingOccurrencesOfString:@"model=iPad8%2C9" withString:@"model=iPhone18%2C2"];
-    v = [v stringByReplacingOccurrencesOfString:@"modelIdentifier=iPad8%2C9" withString:@"modelIdentifier=iPhone18%2C2"];
-    v = [v stringByReplacingOccurrencesOfString:@"model=iPad8,9" withString:@"model=iPhone18,2"];
-    v = [v stringByReplacingOccurrencesOfString:@"modelIdentifier=iPad8,9" withString:@"modelIdentifier=iPhone18,2"];
-    v = [v stringByReplacingOccurrencesOfString:@"systemName=iPadOS" withString:@"systemName=iOS"];
-    v = [v stringByReplacingOccurrencesOfString:@"systemName%3DiPadOS" withString:@"systemName%3DiOS"];
-    v = [v stringByReplacingOccurrencesOfString:@"iPad8%252C9" withString:kQQEiPhone17PMEnc2];
-    v = [v stringByReplacingOccurrencesOfString:@"iPad8%2C9" withString:kQQEiPhone17PMEnc1];
-    v = [v stringByReplacingOccurrencesOfString:@"iPad8,9" withString:kQQEiPhone17PMIdentifier];
-    return v;
-}
-
-static id qqePatchObjectIfNeeded(id obj) {
-    if (!pref_fakeDevice) return obj;
-    if ([obj isKindOfClass:[NSString class]]) return qqePatchIPhone17ProMaxString((NSString *)obj);
-    return obj;
-}
-
-static void qqePatchModelDictionary(id dict) {
-    if (!pref_fakeDevice || !dict) return;
-    if (![dict respondsToSelector:@selector(objectForKey:)]) return;
-
-    NSArray *keys = @[@"model", @"modelIdentifier"];
-    for (NSString *key in keys) {
-        id old = nil;
-        @try { old = [dict objectForKey:key]; } @catch (__unused NSException *e) { old = nil; }
-        if (![old isKindOfClass:[NSString class]]) continue;
-        NSString *fixed = qqePatchIPhone17ProMaxString((NSString *)old);
-        if (![fixed isEqualToString:old] && [dict respondsToSelector:@selector(setObject:forKey:)]) {
-            @try { [dict setObject:fixed forKey:key]; } @catch (__unused NSException *e) {}
-        }
-    }
-}
-
 %hook UIDevice
-
-- (NSString *)name {
-    return pref_fakeDevice ? kQQEiPhone17PMName : %orig;
-}
-
-- (NSString *)model {
-    return pref_fakeDevice ? kQQEiPhone17PMIdentifier : %orig;
-}
-
-- (NSString *)localizedModel {
-    return pref_fakeDevice ? @"iPhone" : %orig;
-}
-
-- (NSString *)systemName {
-    return pref_fakeDevice ? @"iOS" : %orig;
-}
 
 - (float)batteryLevel {
     return pref_fakeBattery ? pref_batteryLevel : %orig;
@@ -1380,95 +1608,6 @@ static void qqePatchModelDictionary(id dict) {
         return pref_isCharging ? UIDeviceBatteryStateCharging : UIDeviceBatteryStateUnplugged;
     }
     return %orig;
-}
-
-%end
-
-%hook NSMutableDictionary
-
-- (void)setValue:(id)value forKey:(NSString *)key {
-    if (qqeShouldPatchDeviceKey(key)) value = qqePatchObjectIfNeeded(value);
-    %orig(value, key);
-}
-
-- (void)setObject:(id)obj forKey:(id<NSCopying>)key {
-    if (qqeShouldPatchDeviceKey((id)key)) obj = qqePatchObjectIfNeeded(obj);
-    %orig(obj, key);
-}
-
-%end
-
-%hook NSDictionary
-
-- (id)objectForKey:(id)key {
-    id ret = %orig;
-    if (qqeShouldPatchDeviceKey(key)) return qqePatchObjectIfNeeded(ret);
-    return ret;
-}
-
-%end
-
-%hook NSURL
-
-+ (id)parseQueryComponentsFromQueryString:(id)query includingDuplicateParamName:(BOOL)includingDuplicateParamName {
-    if (pref_fakeDevice && [query isKindOfClass:[NSString class]]) {
-        query = qqePatchIPhone17ProMaxString((NSString *)query);
-    }
-    id ret = %orig(query, includingDuplicateParamName);
-    qqePatchModelDictionary(ret);
-    return ret;
-}
-
-- (id)queryComponentNamed:(id)name index:(NSUInteger)index {
-    id ret = %orig(name, index);
-    if (qqeShouldPatchDeviceKey(name)) return qqePatchObjectIfNeeded(ret);
-    return ret;
-}
-
-- (NSString *)absoluteString {
-    return qqePatchIPhone17ProMaxString(%orig);
-}
-
-- (NSString *)query {
-    return qqePatchIPhone17ProMaxString(%orig);
-}
-
-%end
-
-%hook QQURLBuilder
-
-- (id)getParames {
-    id ret = %orig;
-    qqePatchModelDictionary(ret);
-    return qqePatchObjectIfNeeded(ret);
-}
-
-%end
-
-%hook QQOfflineWebApp
-
-- (id)getBidFromUrl:(id)url {
-    if (pref_fakeDevice && [url isKindOfClass:[NSString class]]) url = qqePatchIPhone17ProMaxString((NSString *)url);
-    return %orig(url);
-}
-
-- (void)preLoadOfflineCache:(id)url {
-    if (pref_fakeDevice && [url isKindOfClass:[NSString class]]) url = qqePatchIPhone17ProMaxString((NSString *)url);
-    %orig(url);
-}
-
-%end
-
-%hook QQWebViewController
-
-+ (id)newWith:(id)url forStyle:(NSInteger)style {
-    if (pref_fakeDevice && [url isKindOfClass:[NSString class]]) url = qqePatchIPhone17ProMaxString((NSString *)url);
-    return %orig(url, style);
-}
-
-- (id)initWith:(id)url forStyle:(NSInteger)style enableWKForAIO:(BOOL)enableWKForAIO needEncode:(BOOL)needEncode {
-    if (pref_fakeDevice && [url isKindOfClass:[NSString class]]) url = qqePatchIPhone17ProMaxString((NSString *)url);
-    return %orig(url, style, enableWKForAIO, needEncode);
 }
 
 %end
@@ -1564,7 +1703,7 @@ static void qqesign_installNetworkHooks(void) {
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
-        NSLog(@"[QQESign] v2.1 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d fakeDevice(iPhone17PM)=%d fakeBatt=%d",
-              pref_antiRevoke, pref_flashUnlimited, pref_fakeDevice, pref_fakeBattery);
+        NSLog(@"[QQESign] v2.2 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d fakeBatt=%d",
+              pref_antiRevoke, pref_flashUnlimited, pref_fakeBattery);
     }
 }
