@@ -1516,8 +1516,8 @@ static void qqePatchModelDictionary(id dict) {
 #pragma mark - 6. 网络层防撤回 (SSLRead Hook)
 // ─────────────────────────────────────────────
 
-typedef OSStatus (*SSLReadFunc)(void *, void *, size_t, size_t *);
-static SSLReadFunc orig_SSLRead = NULL;
+typedef OSStatus (*QQESSLReadOriginalFn)(void *context, void *data, size_t dataLength, size_t *processed);
+static QQESSLReadOriginalFn orig_SSLRead = NULL;
 
 static OSStatus hooked_SSLRead(void *context, void *data, size_t dataLength, size_t *processed) {
     OSStatus ret = orig_SSLRead(context, data, dataLength, processed);
