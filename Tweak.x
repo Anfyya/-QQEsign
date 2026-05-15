@@ -44,6 +44,7 @@ static NSString *const kPrefSuite = @"com.qqesign.prefs";
 
 static BOOL   pref_antiRevoke     = YES;
 static BOOL   pref_flashUnlimited = YES;
+static BOOL   pref_qzoneAdBlock   = YES;
 static BOOL   pref_fakeBattery    = NO;
 static float  pref_batteryLevel   = 0.80f;
 static BOOL   pref_isCharging     = NO;
@@ -56,6 +57,7 @@ static NSUserDefaults *tweakDefaults(void) {
         [ud registerDefaults:@{
             @"antiRevoke":     @YES,
             @"flashUnlimited": @YES,
+            @"qzoneAdBlock":   @YES,
             @"fakeBattery":    @NO,
             @"batteryLevel":   @0.80f,
             @"isCharging":     @NO,
@@ -70,6 +72,7 @@ static void loadPrefs(void) {
     NSUserDefaults *ud = tweakDefaults();
     pref_antiRevoke     = [ud boolForKey:@"antiRevoke"];
     pref_flashUnlimited = [ud boolForKey:@"flashUnlimited"];
+    pref_qzoneAdBlock   = [ud boolForKey:@"qzoneAdBlock"];
     pref_fakeBattery    = [ud boolForKey:@"fakeBattery"];
     pref_batteryLevel   = [ud floatForKey:@"batteryLevel"];
     pref_isCharging     = [ud boolForKey:@"isCharging"];
@@ -207,7 +210,10 @@ static UIWindow *activeForegroundWindow(void) {
 - (void)rebuildSections {
     _sectionTitles = @[@"消息防撤回", @"闪照设置", @"自定义电量", @"关于"];
     _sections = @[
-        @[@{@"title": @"开启防撤回", @"key": @"antiRevoke", @"type": @"switch"}],
+        @[
+            @{@"title": @"开启防撤回", @"key": @"antiRevoke", @"type": @"switch"},
+            @{@"title": @"好友动态精准去广告", @"key": @"qzoneAdBlock", @"type": @"switch"},
+        ],
         @[@{@"title": @"无限次查看闪照", @"key": @"flashUnlimited", @"type": @"switch"}],
         @[
             @{@"title": @"启用自定义电量", @"key": @"fakeBattery", @"type": @"switch"},
@@ -1613,6 +1619,237 @@ static void qqesignInstallRecallHooksWithRetry(void) {
 %end
 
 // ─────────────────────────────────────────────
+#pragma mark - 4.5 QZone Feed Ad Block
+
+static NSString *const kQQESignQZoneAdHex = @"6164766572746973656D656E74";
+
+static Ivar qqesignFindIvar(Class cls, const char *name) {
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        Ivar iv = class_getInstanceVariable(c, name);
+        if (iv) return iv;
+    }
+    return NULL;
+}
+
+static id qqesignObjectIvar(id obj, const char *name) {
+    if (!obj || !name) return nil;
+    @try {
+        Ivar iv = qqesignFindIvar([obj class], name);
+        return iv ? object_getIvar(obj, iv) : nil;
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static id qqesignCallZeroArgObject(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return nil;
+    @try {
+        id (*imp)(id, SEL) = (id (*)(id, SEL))[obj methodForSelector:sel];
+        return imp ? imp(obj, sel) : nil;
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static NSString *qqesignStringValue(id value) {
+    if (!value) return nil;
+    if ([value isKindOfClass:[NSString class]]) return (NSString *)value;
+    @try {
+        return [value description];
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static NSString *qqesignQZoneFeedKey(id model) {
+    if (!model) return nil;
+
+    NSString *key = qqesignStringValue(qqesignObjectIvar(model, "_feedskey"));
+    if (key.length > 0) return key;
+
+    key = qqesignStringValue(qqesignObjectIvar(model, "_feedsKey"));
+    if (key.length > 0) return key;
+
+    id comm = qqesignObjectIvar(model, "_comm");
+    key = qqesignStringValue(qqesignObjectIvar(comm, "_feedskey"));
+    if (key.length > 0) return key;
+
+    key = qqesignStringValue(qqesignObjectIvar(comm, "_feedsKey"));
+    if (key.length > 0) return key;
+
+    key = qqesignStringValue(qqesignCallZeroArgObject(model, @selector(feedsKey)));
+    if (key.length > 0) return key;
+
+    key = qqesignStringValue(qqesignCallZeroArgObject(model, @selector(feedskey)));
+    return key.length > 0 ? key : nil;
+}
+
+static BOOL qqesignIsQZoneHardAdModel(id model) {
+    if (!pref_qzoneAdBlock || !model) return NO;
+    NSString *key = qqesignQZoneFeedKey(model);
+    if (key.length == 0) return NO;
+
+    if ([key rangeOfString:kQQESignQZoneAdHex options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    if ([key rangeOfString:@"advertisement" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    return NO;
+}
+
+static id qqesignQZonePresenterFeedList(id presenter) {
+    id list = qqesignCallZeroArgObject(presenter, @selector(feedModelList));
+    if (list) return list;
+    return qqesignObjectIvar(presenter, "_feedModelList");
+}
+
+static id qqesignQZonePresenterModelAtIndexPath(id presenter, NSIndexPath *indexPath) {
+    if (!presenter || !indexPath) return nil;
+    id list = qqesignQZonePresenterFeedList(presenter);
+    if (![list respondsToSelector:@selector(count)] || ![list respondsToSelector:@selector(objectAtIndex:)]) return nil;
+
+    NSUInteger row = indexPath.row;
+    @try {
+        NSUInteger count = [list count];
+        if (row >= count) return nil;
+        return [list objectAtIndex:row];
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static void qqesignApplyQZoneMutedState(UIView *view, BOOL muted) {
+    if (![view isKindOfClass:[UIView class]]) return;
+    view.hidden = muted;
+    view.alpha = muted ? 0.0 : 1.0;
+    view.userInteractionEnabled = !muted;
+    view.clipsToBounds = YES;
+}
+
+static void qqesignMuteQZoneAdCell(id cell, BOOL muted) {
+    if (![cell isKindOfClass:[UITableViewCell class]]) return;
+    UITableViewCell *tvCell = (UITableViewCell *)cell;
+    qqesignApplyQZoneMutedState(tvCell, muted);
+    qqesignApplyQZoneMutedState(tvCell.contentView, muted);
+    qqesignApplyQZoneMutedState(tvCell.backgroundView, muted);
+    qqesignApplyQZoneMutedState(tvCell.selectedBackgroundView, muted);
+}
+
+static void qqesignMuteQZoneAdLayoutView(id view, BOOL muted) {
+    if (![view isKindOfClass:[UIView class]]) return;
+    qqesignApplyQZoneMutedState((UIView *)view, muted);
+}
+
+static void qqesignLogQZoneAdBlock(id model, NSString *source) {
+    static NSUInteger count = 0;
+    if (!qqesignIsQZoneHardAdModel(model)) return;
+    count++;
+    if (count <= 12 || (count % 50) == 0) {
+        QQELog(@"[QQESign] 好友动态广告拦截 %@ #%lu key=%@",
+               source ?: @"qzone",
+               (unsigned long)count,
+               qqesignQZoneFeedKey(model));
+    }
+}
+
+%hook MQZoneActiveFeedViewController
+
+- (CGFloat)qz_tableView:(id)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    id presenter = qqesignObjectIvar(self, "_feedListPresenter");
+    id model = qqesignQZonePresenterModelAtIndexPath(presenter, indexPath);
+    if (qqesignIsQZoneHardAdModel(model)) {
+        qqesignLogQZoneAdBlock(model, @"height");
+        return 0.01;
+    }
+    return %orig;
+}
+
+- (id)tableViewForGroupFeedCell:(id)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath withFeedModel:(id)model {
+    id cell = %orig;
+    BOOL isAd = qqesignIsQZoneHardAdModel(model);
+    qqesignMuteQZoneAdCell(cell, isAd);
+    if (isAd) qqesignLogQZoneAdBlock(model, @"group-cell");
+    return cell;
+}
+
+%end
+
+%hook QZFeedListPresenter
+
+- (CGFloat)heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    id model = qqesignQZonePresenterModelAtIndexPath(self, indexPath);
+    if (qqesignIsQZoneHardAdModel(model)) {
+        qqesignLogQZoneAdBlock(model, @"presenter-height");
+        return 0.01;
+    }
+    return %orig;
+}
+
+- (id)tableView:(id)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    id model = qqesignQZonePresenterModelAtIndexPath(self, indexPath);
+    id cell = %orig;
+    BOOL isAd = qqesignIsQZoneHardAdModel(model);
+    qqesignMuteQZoneAdCell(cell, isAd);
+    if (isAd) qqesignLogQZoneAdBlock(model, @"presenter-cell");
+    return cell;
+}
+
+%end
+
+%hook QzoneFeedCell
+
+- (void)setFeedModel:(id)model {
+    %orig;
+    BOOL isAd = qqesignIsQZoneHardAdModel(model);
+    qqesignMuteQZoneAdCell(self, isAd);
+    if (isAd) qqesignLogQZoneAdBlock(model, @"cell-model");
+}
+
+- (void)prepareForReuse {
+    %orig;
+    qqesignMuteQZoneAdCell(self, NO);
+}
+
++ (CGFloat)heightWithDetailNewFeedModel:(id)model
+                              indexPath:(NSIndexPath *)indexPath
+                           isFamousZone:(BOOL)isFamousZone
+                             isFirstRow:(BOOL)isFirstRow
+                        realLastSection:(BOOL)realLastSection
+                   isInVideoCommentView:(BOOL)isInVideoCommentView
+                  isInCommentDetailView:(BOOL)isInCommentDetailView {
+    if (qqesignIsQZoneHardAdModel(model)) {
+        qqesignLogQZoneAdBlock(model, @"cell-detail-height");
+        return 0.01;
+    }
+    return %orig;
+}
+
++ (CGFloat)heightWithNewFeedModel:(id)model {
+    if (qqesignIsQZoneHardAdModel(model)) {
+        qqesignLogQZoneAdBlock(model, @"cell-height");
+        return 0.01;
+    }
+    return %orig;
+}
+
++ (CGFloat)heightWithNewFeedModel:(id)model param:(id)param {
+    if (qqesignIsQZoneHardAdModel(model)) {
+        qqesignLogQZoneAdBlock(model, @"cell-height-param");
+        return 0.01;
+    }
+    return %orig;
+}
+
+%end
+
+%hook QzoneFeedLayoutView
+
+- (void)setFeedModel:(id)model {
+    %orig;
+    BOOL isAd = qqesignIsQZoneHardAdModel(model);
+    qqesignMuteQZoneAdLayoutView(self, isAd);
+    if (isAd) qqesignLogQZoneAdBlock(model, @"layout-model");
+}
+
+%end
+
 #pragma mark - 5. 设置入口
 // ─────────────────────────────────────────────
 
@@ -1700,10 +1937,11 @@ static void qqesign_installNetworkHooks(void) {
 %ctor {
     @autoreleasepool {
         loadPrefs();
+        %init;
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
-        NSLog(@"[QQESign] v2.2 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d fakeBatt=%d",
-              pref_antiRevoke, pref_flashUnlimited, pref_fakeBattery);
+        NSLog(@"[QQESign] v2.2 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d fakeBatt=%d",
+              pref_antiRevoke, pref_flashUnlimited, pref_qzoneAdBlock, pref_fakeBattery);
     }
 }
