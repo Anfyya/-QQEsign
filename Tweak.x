@@ -67,6 +67,7 @@ static NSUserDefaults *tweakDefaults(void) {
 }
 
 static void qqesignClearModelAntiRecallRuntimeCache(void);
+static void qqesignInstallQZoneAdHooks(const char *reason);
 
 static void loadPrefs(void) {
     NSUserDefaults *ud = tweakDefaults();
@@ -1492,6 +1493,7 @@ static void qqesignRecallImageAdded(const struct mach_header *mh, intptr_t vmadd
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         qqesignInstallRecallHooksPass("dyld-add-image");
+        qqesignInstallQZoneAdHooks("dyld-add-image");
     });
 }
 
@@ -1501,6 +1503,7 @@ static void qqesignInstallRecallHooksWithRetry(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             qqesignInstallRecallHooksPass("delayed-ctor");
+            qqesignInstallQZoneAdHooks("delayed-ctor");
         });
 
         _dyld_register_func_for_add_image(qqesignRecallImageAdded);
@@ -1510,6 +1513,7 @@ static void qqesignInstallRecallHooksWithRetry(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 qqesignInstallRecallHooksPass("retry");
+                qqesignInstallQZoneAdHooks("retry");
             });
         }
     });
@@ -1749,6 +1753,8 @@ static void qqesignLogQZoneAdBlock(id model, NSString *source) {
     }
 }
 
+%group QZoneAdBlock
+
 %hook MQZoneActiveFeedViewController
 
 - (CGFloat)qz_tableView:(id)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1849,6 +1855,27 @@ static void qqesignLogQZoneAdBlock(id model, NSString *source) {
 }
 
 %end
+
+%end // %group QZoneAdBlock
+
+static BOOL gQQESignQZoneAdHooksInstalled = NO;
+
+static void qqesignInstallQZoneAdHooks(const char *reason) {
+    if (gQQESignQZoneAdHooksInstalled) return;
+
+    // QZone 相关类常常在子模块/bundle 里，注入时尚未加载;
+    // 4 个 sentinel 都到位后再调用 %init(QZoneAdBlock),避免静默漏装。
+    if (!objc_getClass("QzoneFeedCell") ||
+        !objc_getClass("QzoneFeedLayoutView") ||
+        !objc_getClass("QZFeedListPresenter") ||
+        !objc_getClass("MQZoneActiveFeedViewController")) {
+        return;
+    }
+
+    gQQESignQZoneAdHooksInstalled = YES;
+    %init(QZoneAdBlock);
+    NSLog(@"[QQESign] %s 安装好友动态去广告 Hook 完成", reason ? reason : "qzone-ads");
+}
 
 #pragma mark - 5. 设置入口
 // ─────────────────────────────────────────────
