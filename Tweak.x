@@ -2176,9 +2176,10 @@ static void qqesignDrawerInstallSubclassHook(NSString *className, UITableView *t
 
 - (void)prepareForReuse {
     %orig;
-    self.hidden = NO;
-    self.alpha = 1.0;
-    self.userInteractionEnabled = YES;
+    UIView *view = (UIView *)self;
+    view.hidden = NO;
+    view.alpha = 1.0;
+    view.userInteractionEnabled = YES;
 }
 
 %end
