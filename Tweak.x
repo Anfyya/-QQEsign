@@ -1508,7 +1508,7 @@ static void qqesignInstallRecallHooksWithRetry(void) {
 
         _dyld_register_func_for_add_image(qqesignRecallImageAdded);
 
-        NSArray<NSNumber *> *delays = @[@3.0, @8.0, @15.0];
+        NSArray<NSNumber *> *delays = @[@3.0, @8.0, @15.0, @30.0, @60.0];
         for (NSNumber *delay in delays) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
@@ -1742,18 +1742,11 @@ static void qqesignMuteQZoneAdLayoutView(id view, BOOL muted) {
 }
 
 static void qqesignLogQZoneAdBlock(id model, NSString *source) {
-    static NSUInteger count = 0;
-    if (!qqesignIsQZoneHardAdModel(model)) return;
-    count++;
-    if (count <= 12 || (count % 50) == 0) {
-        QQELog(@"[QQESign] 好友动态广告拦截 %@ #%lu key=%@",
-               source ?: @"qzone",
-               (unsigned long)count,
-               qqesignQZoneFeedKey(model));
-    }
+    (void)model;
+    (void)source;
 }
 
-%group QZoneAdBlock
+%group QZoneAdBlockController
 
 %hook MQZoneActiveFeedViewController
 
@@ -1777,6 +1770,10 @@ static void qqesignLogQZoneAdBlock(id model, NSString *source) {
 
 %end
 
+%end // %group QZoneAdBlockController
+
+%group QZoneAdBlockPresenter
+
 %hook QZFeedListPresenter
 
 - (CGFloat)heightForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1798,6 +1795,10 @@ static void qqesignLogQZoneAdBlock(id model, NSString *source) {
 }
 
 %end
+
+%end // %group QZoneAdBlockPresenter
+
+%group QZoneAdBlockCell
 
 %hook QzoneFeedCell
 
@@ -1845,6 +1846,10 @@ static void qqesignLogQZoneAdBlock(id model, NSString *source) {
 
 %end
 
+%end // %group QZoneAdBlockCell
+
+%group QZoneAdBlockLayout
+
 %hook QzoneFeedLayoutView
 
 - (void)setFeedModel:(id)model {
@@ -1856,25 +1861,52 @@ static void qqesignLogQZoneAdBlock(id model, NSString *source) {
 
 %end
 
-%end // %group QZoneAdBlock
+%end // %group QZoneAdBlockLayout
 
-static BOOL gQQESignQZoneAdHooksInstalled = NO;
+static BOOL gQQESignQZoneControllerHooksInstalled = NO;
+static BOOL gQQESignQZonePresenterHooksInstalled = NO;
+static BOOL gQQESignQZoneCellHooksInstalled = NO;
+static BOOL gQQESignQZoneLayoutHooksInstalled = NO;
 
 static void qqesignInstallQZoneAdHooks(const char *reason) {
-    if (gQQESignQZoneAdHooksInstalled) return;
+    BOOL installed = NO;
 
-    // QZone 相关类常常在子模块/bundle 里，注入时尚未加载;
-    // 4 个 sentinel 都到位后再调用 %init(QZoneAdBlock),避免静默漏装。
-    if (!objc_getClass("QzoneFeedCell") ||
-        !objc_getClass("QzoneFeedLayoutView") ||
-        !objc_getClass("QZFeedListPresenter") ||
-        !objc_getClass("MQZoneActiveFeedViewController")) {
-        return;
+    if (!gQQESignQZoneControllerHooksInstalled &&
+        objc_getClass("MQZoneActiveFeedViewController")) {
+        gQQESignQZoneControllerHooksInstalled = YES;
+        %init(QZoneAdBlockController);
+        installed = YES;
     }
 
-    gQQESignQZoneAdHooksInstalled = YES;
-    %init(QZoneAdBlock);
-    NSLog(@"[QQESign] %s 安装好友动态去广告 Hook 完成", reason ? reason : "qzone-ads");
+    if (!gQQESignQZonePresenterHooksInstalled &&
+        objc_getClass("QZFeedListPresenter")) {
+        gQQESignQZonePresenterHooksInstalled = YES;
+        %init(QZoneAdBlockPresenter);
+        installed = YES;
+    }
+
+    if (!gQQESignQZoneCellHooksInstalled &&
+        objc_getClass("QzoneFeedCell")) {
+        gQQESignQZoneCellHooksInstalled = YES;
+        %init(QZoneAdBlockCell);
+        installed = YES;
+    }
+
+    if (!gQQESignQZoneLayoutHooksInstalled &&
+        objc_getClass("QzoneFeedLayoutView")) {
+        gQQESignQZoneLayoutHooksInstalled = YES;
+        %init(QZoneAdBlockLayout);
+        installed = YES;
+    }
+
+    if (installed) {
+        NSLog(@"[QQESign] %s 安装好友动态去广告 Hook 完成 controller=%d presenter=%d cell=%d layout=%d",
+              reason ? reason : "qzone-ads",
+              gQQESignQZoneControllerHooksInstalled,
+              gQQESignQZonePresenterHooksInstalled,
+              gQQESignQZoneCellHooksInstalled,
+              gQQESignQZoneLayoutHooksInstalled);
+    }
 }
 
 #pragma mark - 5. 设置入口
