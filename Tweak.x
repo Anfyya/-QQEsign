@@ -49,18 +49,34 @@ static BOOL   pref_fakeBattery    = NO;
 static float  pref_batteryLevel   = 0.80f;
 static BOOL   pref_isCharging     = NO;
 
+// 主页头像侧边抽屉入口屏蔽 (7 项, 默认全关)
+static BOOL   pref_drawerHideAlbum    = NO;
+static BOOL   pref_drawerHideFavorite = NO;
+static BOOL   pref_drawerHideFiles    = NO;
+static BOOL   pref_drawerHideWallet   = NO;
+static BOOL   pref_drawerHideVip      = NO;
+static BOOL   pref_drawerHideDecor    = NO;
+static BOOL   pref_drawerHideFreedata = NO;
+
 static NSUserDefaults *tweakDefaults(void) {
     static NSUserDefaults *ud = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         ud = [[NSUserDefaults alloc] initWithSuiteName:kPrefSuite];
         [ud registerDefaults:@{
-            @"antiRevoke":     @YES,
-            @"flashUnlimited": @YES,
-            @"qzoneAdBlock":   @YES,
-            @"fakeBattery":    @NO,
-            @"batteryLevel":   @0.80f,
-            @"isCharging":     @NO,
+            @"antiRevoke":          @YES,
+            @"flashUnlimited":      @YES,
+            @"qzoneAdBlock":        @YES,
+            @"fakeBattery":         @NO,
+            @"batteryLevel":        @0.80f,
+            @"isCharging":          @NO,
+            @"drawerHideAlbum":     @NO,
+            @"drawerHideFavorite":  @NO,
+            @"drawerHideFiles":     @NO,
+            @"drawerHideWallet":    @NO,
+            @"drawerHideVip":       @NO,
+            @"drawerHideDecor":     @NO,
+            @"drawerHideFreedata":  @NO,
         }];
     });
     return ud;
@@ -68,6 +84,8 @@ static NSUserDefaults *tweakDefaults(void) {
 
 static void qqesignClearModelAntiRecallRuntimeCache(void);
 static void qqesignInstallQZoneAdHooks(const char *reason);
+static void qqesignInstallDrawerHooks(const char *reason);
+static void qqesignDrawerClearAllBlockedModels(void);
 
 static void loadPrefs(void) {
     NSUserDefaults *ud = tweakDefaults();
@@ -77,6 +95,13 @@ static void loadPrefs(void) {
     pref_fakeBattery    = [ud boolForKey:@"fakeBattery"];
     pref_batteryLevel   = [ud floatForKey:@"batteryLevel"];
     pref_isCharging     = [ud boolForKey:@"isCharging"];
+    pref_drawerHideAlbum    = [ud boolForKey:@"drawerHideAlbum"];
+    pref_drawerHideFavorite = [ud boolForKey:@"drawerHideFavorite"];
+    pref_drawerHideFiles    = [ud boolForKey:@"drawerHideFiles"];
+    pref_drawerHideWallet   = [ud boolForKey:@"drawerHideWallet"];
+    pref_drawerHideVip      = [ud boolForKey:@"drawerHideVip"];
+    pref_drawerHideDecor    = [ud boolForKey:@"drawerHideDecor"];
+    pref_drawerHideFreedata = [ud boolForKey:@"drawerHideFreedata"];
 }
 
 static NSString *qqesignRuntimeLogPath(void) {
@@ -209,13 +234,22 @@ static UIWindow *activeForegroundWindow(void) {
 }
 
 - (void)rebuildSections {
-    _sectionTitles = @[@"消息防撤回", @"闪照设置", @"自定义电量", @"关于"];
+    _sectionTitles = @[@"消息防撤回", @"闪照设置", @"主页入口屏蔽", @"自定义电量", @"关于"];
     _sections = @[
         @[
             @{@"title": @"开启防撤回", @"key": @"antiRevoke", @"type": @"switch"},
             @{@"title": @"好友动态精准去广告", @"key": @"qzoneAdBlock", @"type": @"switch"},
         ],
         @[@{@"title": @"无限次查看闪照", @"key": @"flashUnlimited", @"type": @"switch"}],
+        @[
+            @{@"title": @"隐藏「相册」",     @"key": @"drawerHideAlbum",    @"type": @"switch"},
+            @{@"title": @"隐藏「收藏」",     @"key": @"drawerHideFavorite", @"type": @"switch"},
+            @{@"title": @"隐藏「文件」",     @"key": @"drawerHideFiles",    @"type": @"switch"},
+            @{@"title": @"隐藏「钱包」",     @"key": @"drawerHideWallet",   @"type": @"switch"},
+            @{@"title": @"隐藏「会员中心」", @"key": @"drawerHideVip",      @"type": @"switch"},
+            @{@"title": @"隐藏「个性装扮」", @"key": @"drawerHideDecor",    @"type": @"switch"},
+            @{@"title": @"隐藏「免流量」",   @"key": @"drawerHideFreedata", @"type": @"switch"},
+        ],
         @[
             @{@"title": @"启用自定义电量", @"key": @"fakeBattery", @"type": @"switch"},
             @{@"title": @"电量 (0~100)", @"key": @"batteryLevel", @"type": @"number"},
@@ -306,6 +340,10 @@ static UIWindow *activeForegroundWindow(void) {
     if ([key isEqualToString:@"antiRevoke"] && !sw.on) {
         qqesignClearModelAntiRecallRuntimeCache();
         QQELog(@"[QQESign] 防撤回开关关闭：运行缓存和持久化缓存已清空，后续撤回放行");
+    }
+    if ([key hasPrefix:@"drawerHide"]) {
+        // 抽屉入口屏蔽开关变化: 清空已标记 model, 下次抽屉重新展开时按新设置评估
+        qqesignDrawerClearAllBlockedModels();
     }
 }
 
@@ -1494,6 +1532,7 @@ static void qqesignRecallImageAdded(const struct mach_header *mh, intptr_t vmadd
                    dispatch_get_main_queue(), ^{
         qqesignInstallRecallHooksPass("dyld-add-image");
         qqesignInstallQZoneAdHooks("dyld-add-image");
+        qqesignInstallDrawerHooks("dyld-add-image");
     });
 }
 
@@ -1504,6 +1543,7 @@ static void qqesignInstallRecallHooksWithRetry(void) {
                        dispatch_get_main_queue(), ^{
             qqesignInstallRecallHooksPass("delayed-ctor");
             qqesignInstallQZoneAdHooks("delayed-ctor");
+            qqesignInstallDrawerHooks("delayed-ctor");
         });
 
         _dyld_register_func_for_add_image(qqesignRecallImageAdded);
@@ -1514,6 +1554,7 @@ static void qqesignInstallRecallHooksWithRetry(void) {
                            dispatch_get_main_queue(), ^{
                 qqesignInstallRecallHooksPass("retry");
                 qqesignInstallQZoneAdHooks("retry");
+                qqesignInstallDrawerHooks("retry");
             });
         }
     });
@@ -1909,6 +1950,332 @@ static void qqesignInstallQZoneAdHooks(const char *reason) {
     }
 }
 
+// ─────────────────────────────────────────────
+#pragma mark - 4.6 主页头像侧边抽屉入口屏蔽
+
+// 思路 (Frida 实测验证过):
+//   1. drawer cell 类是 DrawerDynamicIconViewCell, 标签是 QUIBlendLabelView
+//   2. 数据源是 QUIListView 的运行时子类 QUIListView_redPoint_extendClass_container,
+//      子类重写 cellForRow 不调 super, 标题靠 _customGenerateCellBlock 闭包配置,
+//      所以 model (NewDrawerListSingleLineConfig) 自身不存标题字符串
+//   3. 关键时序: setText 是 cellForRow 调用栈内部触发的,
+//      用一个全局 cellForRow context (currentPart + currentIndexPath) 接力
+//   4. UITableView.reloadData hook 检测到 QUIListView_* 子类时,
+//      用 runtime swizzle 动态拦截子类的 cellForRow (子类 install 时不存在)
+//   5. heightForRow 在 QUIListView 基类, 不被子类 override, %hook 基类即可
+//   6. begin/endUpdates 强制 UITableView 重新询问行高
+
+static NSString *const kQQESignDrawerCellClass = @"DrawerDynamicIconViewCell";
+
+// cellForRow 调用栈内的上下文 (单线程主队列, 不需要锁)
+static __weak id qqesignDrawerCurrentPart = nil;
+static NSIndexPath *qqesignDrawerCurrentIP = nil;
+
+// 已标记屏蔽的 model 集合; weak key 自动随 model 释放
+static NSMapTable<id, NSNumber *> *qqesignDrawerBlockedModels = nil;
+// 已调度高度刷新的 tableView 防重 (weak)
+static NSHashTable<UITableView *> *qqesignDrawerRefreshScheduled = nil;
+// 已动态 swizzle 的子类名集合
+static NSMutableSet<NSString *> *qqesignDrawerSubclassHooked = nil;
+// 动态子类 cellForRow 的原始 IMP (一份, 实测只有一个子类 QUIListView_redPoint_extendClass_container)
+static IMP qqesignDrawerSubclassOrigCellForRow = NULL;
+
+static void qqesignDrawerEnsureState(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        qqesignDrawerBlockedModels =
+            [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                  valueOptions:NSPointerFunctionsStrongMemory];
+        qqesignDrawerRefreshScheduled = [NSHashTable weakObjectsHashTable];
+        qqesignDrawerSubclassHooked = [NSMutableSet set];
+    });
+}
+
+static BOOL qqesignDrawerAnyEnabled(void) {
+    return pref_drawerHideAlbum || pref_drawerHideFavorite || pref_drawerHideFiles ||
+           pref_drawerHideWallet || pref_drawerHideVip || pref_drawerHideDecor ||
+           pref_drawerHideFreedata;
+}
+
+static BOOL qqesignDrawerShouldBlockText(NSString *text) {
+    if (text.length == 0) return NO;
+    if (pref_drawerHideAlbum    && [text isEqualToString:@"相册"]) return YES;
+    if (pref_drawerHideFavorite && [text isEqualToString:@"收藏"]) return YES;
+    if (pref_drawerHideFiles    && [text isEqualToString:@"文件"]) return YES;
+    if (pref_drawerHideWallet   && ([text isEqualToString:@"钱包"] ||
+                                    [text isEqualToString:@"QQ钱包"])) return YES;
+    if (pref_drawerHideVip      && ([text isEqualToString:@"会员中心"] ||
+                                    [text isEqualToString:@"QQ会员"] ||
+                                    [text isEqualToString:@"超级会员"])) return YES;
+    if (pref_drawerHideDecor    && ([text isEqualToString:@"个性装扮"] ||
+                                    [text isEqualToString:@"装扮"])) return YES;
+    if (pref_drawerHideFreedata && ([text isEqualToString:@"免流量"] ||
+                                    [text isEqualToString:@"免流"])) return YES;
+    return NO;
+}
+
+static void qqesignDrawerClearAllBlockedModels(void) {
+    qqesignDrawerEnsureState();
+    [qqesignDrawerBlockedModels removeAllObjects];
+}
+
+static UIView *qqesignDrawerFindAncestorCell(UIView *v) {
+    UIView *cur = v;
+    for (int i = 0; cur && i < 15; i++) {
+        if ([NSStringFromClass([cur class]) isEqualToString:kQQESignDrawerCellClass]) return cur;
+        cur = cur.superview;
+    }
+    return nil;
+}
+
+static UITableView *qqesignDrawerFindAncestorTableView(UIView *v) {
+    UIView *cur = v;
+    for (int i = 0; cur && i < 18; i++) {
+        if ([cur isKindOfClass:[UITableView class]]) return (UITableView *)cur;
+        cur = cur.superview;
+    }
+    return nil;
+}
+
+// 取 model: 优先 rowModelWithIndexPath: (QUIListView), 退到 itemWithIndexPath:
+static id qqesignDrawerItemFromPart(id partObj, NSIndexPath *ip) {
+    if (!partObj || !ip) return nil;
+    SEL sels[] = { @selector(rowModelWithIndexPath:), @selector(itemWithIndexPath:) };
+    for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
+        if ([partObj respondsToSelector:sels[i]]) {
+            @try {
+                IMP imp = [partObj methodForSelector:sels[i]];
+                id (*fn)(id, SEL, id) = (id (*)(id, SEL, id))imp;
+                id r = fn(partObj, sels[i], ip);
+                if (r) return r;
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    return nil;
+}
+
+static void qqesignDrawerScheduleHeightRefresh(UITableView *tv) {
+    if (!tv) return;
+    qqesignDrawerEnsureState();
+    if ([qqesignDrawerRefreshScheduled containsObject:tv]) return;
+    [qqesignDrawerRefreshScheduled addObject:tv];
+
+    __weak UITableView *weakTV = tv;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        UITableView *strong = weakTV;
+        if (strong) {
+            @try {
+                [strong beginUpdates];
+                [strong endUpdates];
+            } @catch (__unused NSException *e) {}
+            [qqesignDrawerRefreshScheduled removeObject:strong];
+        }
+    });
+}
+
+// 动态子类 cellForRow 替换 IMP
+static id qqesignDrawerSubclassCellForRowReplacement(id self, SEL _cmd,
+                                                     UITableView *tableView,
+                                                     NSIndexPath *indexPath) {
+    id prevPart = qqesignDrawerCurrentPart;
+    NSIndexPath *prevIP = qqesignDrawerCurrentIP;
+    qqesignDrawerCurrentPart = self;
+    qqesignDrawerCurrentIP = indexPath;
+    id result = nil;
+    if (qqesignDrawerSubclassOrigCellForRow) {
+        @try {
+            id (*orig)(id, SEL, UITableView *, NSIndexPath *) =
+                (id (*)(id, SEL, UITableView *, NSIndexPath *))qqesignDrawerSubclassOrigCellForRow;
+            result = orig(self, _cmd, tableView, indexPath);
+        } @catch (NSException *e) {
+            qqesignDrawerCurrentPart = prevPart;
+            qqesignDrawerCurrentIP = prevIP;
+            @throw;
+        }
+    }
+    qqesignDrawerCurrentPart = prevPart;
+    qqesignDrawerCurrentIP = prevIP;
+    return result;
+}
+
+static void qqesignDrawerInstallSubclassHook(NSString *className, UITableView *tvToReload) {
+    if (!className || className.length == 0) return;
+    qqesignDrawerEnsureState();
+    if ([qqesignDrawerSubclassHooked containsObject:className]) return;
+
+    Class cls = NSClassFromString(className);
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, @selector(tableView:cellForRowAtIndexPath:));
+    if (!m) return;
+
+    // 第一次 swizzle: 保存原 IMP, 替换. 同一个 IMP 即便后续多次子类也复用 (它们都从 QUIListView 继承基础逻辑,
+    // 但运行时子类各自有自己的覆写 IMP). 暂时按 "只见过一种子类" 处理.
+    if (!qqesignDrawerSubclassOrigCellForRow) {
+        qqesignDrawerSubclassOrigCellForRow = method_getImplementation(m);
+    }
+    method_setImplementation(m, (IMP)qqesignDrawerSubclassCellForRowReplacement);
+    [qqesignDrawerSubclassHooked addObject:className];
+    NSLog(@"[QQESign] 抽屉子类 cellForRow 已动态拦截: %@", className);
+
+    if (tvToReload && qqesignDrawerAnyEnabled()) {
+        __weak UITableView *weakTV = tvToReload;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UITableView *strong = weakTV;
+            if (strong) {
+                @try { [strong reloadData]; } @catch (__unused NSException *e) {}
+            }
+        });
+    }
+}
+
+%group QQESignDrawerLabel
+
+%hook UILabel
+
+- (void)setText:(NSString *)text {
+    %orig;
+    if (!qqesignDrawerAnyEnabled() || text.length == 0) return;
+    if (!qqesignDrawerShouldBlockText(text)) return;
+
+    UIView *cell = qqesignDrawerFindAncestorCell(self);
+    if (!cell) return;
+
+    // 软隐藏 (即便高度塌陷失败,视觉上也不可见)
+    cell.hidden = YES;
+    cell.alpha = 0;
+    cell.userInteractionEnabled = NO;
+    cell.clipsToBounds = YES;
+
+    // 用 cellForRow context 反查 model
+    id part = qqesignDrawerCurrentPart;
+    NSIndexPath *ip = qqesignDrawerCurrentIP;
+    if (!part || !ip) return;
+    id item = qqesignDrawerItemFromPart(part, ip);
+    if (!item) return;
+
+    qqesignDrawerEnsureState();
+    if ([qqesignDrawerBlockedModels objectForKey:item]) return;
+    [qqesignDrawerBlockedModels setObject:@YES forKey:item];
+
+    UITableView *tv = nil;
+    if ([part respondsToSelector:@selector(tableView)]) {
+        @try { tv = [part tableView]; } @catch (__unused NSException *e) {}
+    }
+    if (!tv) tv = qqesignDrawerFindAncestorTableView(cell);
+    qqesignDrawerScheduleHeightRefresh(tv);
+}
+
+%end
+
+%end // group QQESignDrawerLabel
+
+%group QQESignDrawerCell
+
+%hook DrawerDynamicIconViewCell
+
+- (void)prepareForReuse {
+    %orig;
+    self.hidden = NO;
+    self.alpha = 1.0;
+    self.userInteractionEnabled = YES;
+}
+
+%end
+
+%end // group QQESignDrawerCell
+
+%group QQESignDrawerList
+
+%hook QUIListView
+
+// 基类 cellForRow: 即便子类不调 super, 该 hook 仍可在直接使用基类的场景生效
+- (id)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    id prevPart = qqesignDrawerCurrentPart;
+    NSIndexPath *prevIP = qqesignDrawerCurrentIP;
+    qqesignDrawerCurrentPart = self;
+    qqesignDrawerCurrentIP = indexPath;
+    id cell = %orig;
+    qqesignDrawerCurrentPart = prevPart;
+    qqesignDrawerCurrentIP = prevIP;
+    return cell;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (qqesignDrawerAnyEnabled()) {
+        id item = qqesignDrawerItemFromPart(self, indexPath);
+        if (item) {
+            qqesignDrawerEnsureState();
+            if ([qqesignDrawerBlockedModels objectForKey:item]) return 0.01;
+        }
+    }
+    return %orig;
+}
+
+%end
+
+%end // group QQESignDrawerList
+
+%group QQESignDrawerReload
+
+%hook UITableView
+
+- (void)reloadData {
+    %orig;
+    if (!qqesignDrawerAnyEnabled()) return;
+    @try {
+        id ds = [self dataSource];
+        if (!ds) return;
+        NSString *dsName = NSStringFromClass([ds class]);
+        if (![dsName hasPrefix:@"QUIListView_"]) return;
+        qqesignDrawerInstallSubclassHook(dsName, self);
+    } @catch (__unused NSException *e) {}
+}
+
+%end
+
+%end // group QQESignDrawerReload
+
+static BOOL gQQESignDrawerLabelHooksInstalled = NO;
+static BOOL gQQESignDrawerCellHooksInstalled = NO;
+static BOOL gQQESignDrawerListHooksInstalled = NO;
+static BOOL gQQESignDrawerReloadHooksInstalled = NO;
+
+static void qqesignInstallDrawerHooks(const char *reason) {
+    qqesignDrawerEnsureState();
+    BOOL installed = NO;
+
+    if (!gQQESignDrawerLabelHooksInstalled) {
+        gQQESignDrawerLabelHooksInstalled = YES;
+        %init(QQESignDrawerLabel);
+        installed = YES;
+    }
+    if (!gQQESignDrawerReloadHooksInstalled) {
+        gQQESignDrawerReloadHooksInstalled = YES;
+        %init(QQESignDrawerReload);
+        installed = YES;
+    }
+    if (!gQQESignDrawerCellHooksInstalled && objc_getClass("DrawerDynamicIconViewCell")) {
+        gQQESignDrawerCellHooksInstalled = YES;
+        %init(QQESignDrawerCell);
+        installed = YES;
+    }
+    if (!gQQESignDrawerListHooksInstalled && objc_getClass("QUIListView")) {
+        gQQESignDrawerListHooksInstalled = YES;
+        %init(QQESignDrawerList);
+        installed = YES;
+    }
+
+    if (installed) {
+        NSLog(@"[QQESign] %s 抽屉入口屏蔽 Hook 安装 label=%d reload=%d cell=%d list=%d",
+              reason ? reason : "drawer-hide",
+              gQQESignDrawerLabelHooksInstalled,
+              gQQESignDrawerReloadHooksInstalled,
+              gQQESignDrawerCellHooksInstalled,
+              gQQESignDrawerListHooksInstalled);
+    }
+}
+
 #pragma mark - 5. 设置入口
 // ─────────────────────────────────────────────
 
@@ -2000,7 +2367,10 @@ static void qqesign_installNetworkHooks(void) {
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
-        NSLog(@"[QQESign] v2.2 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d fakeBatt=%d",
-              pref_antiRevoke, pref_flashUnlimited, pref_qzoneAdBlock, pref_fakeBattery);
+        NSLog(@"[QQESign] v2.3 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d fakeBatt=%d drawerHide=%d",
+              pref_antiRevoke, pref_flashUnlimited, pref_qzoneAdBlock, pref_fakeBattery,
+              (pref_drawerHideAlbum || pref_drawerHideFavorite || pref_drawerHideFiles ||
+               pref_drawerHideWallet || pref_drawerHideVip || pref_drawerHideDecor ||
+               pref_drawerHideFreedata));
     }
 }
