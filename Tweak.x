@@ -45,6 +45,9 @@ static NSString *const kPrefSuite = @"com.qqesign.prefs";
 static BOOL   pref_antiRevoke     = YES;
 static BOOL   pref_flashUnlimited = YES;
 static BOOL   pref_qzoneAdBlock   = YES;
+static BOOL   pref_hideHomeSearch    = YES;
+static BOOL   pref_hideContactSearch = YES;
+static BOOL   pref_hideDynamicSearch = YES;
 static BOOL   pref_fakeBattery    = NO;
 static float  pref_batteryLevel   = 0.80f;
 static BOOL   pref_isCharging     = NO;
@@ -67,6 +70,9 @@ static NSUserDefaults *tweakDefaults(void) {
             @"antiRevoke":          @YES,
             @"flashUnlimited":      @YES,
             @"qzoneAdBlock":        @YES,
+            @"hideHomeSearch":      @YES,
+            @"hideContactSearch":   @YES,
+            @"hideDynamicSearch":   @YES,
             @"fakeBattery":         @NO,
             @"batteryLevel":        @0.80f,
             @"isCharging":          @NO,
@@ -87,12 +93,16 @@ static void qqesignInstallQZoneAdHooks(const char *reason);
 static BOOL qqesignQZoneAdHooksFullyInstalled(void);
 static void qqesignInstallDrawerHooks(const char *reason);
 static void qqesignDrawerClearAllBlockedModels(void);
+static void qqesignInstallTopSearchHooks(const char *reason);
 
 static void loadPrefs(void) {
     NSUserDefaults *ud = tweakDefaults();
     pref_antiRevoke     = [ud boolForKey:@"antiRevoke"];
     pref_flashUnlimited = [ud boolForKey:@"flashUnlimited"];
     pref_qzoneAdBlock   = [ud boolForKey:@"qzoneAdBlock"];
+    pref_hideHomeSearch    = [ud boolForKey:@"hideHomeSearch"];
+    pref_hideContactSearch = [ud boolForKey:@"hideContactSearch"];
+    pref_hideDynamicSearch = [ud boolForKey:@"hideDynamicSearch"];
     pref_fakeBattery    = [ud boolForKey:@"fakeBattery"];
     pref_batteryLevel   = [ud floatForKey:@"batteryLevel"];
     pref_isCharging     = [ud boolForKey:@"isCharging"];
@@ -235,13 +245,18 @@ static UIWindow *activeForegroundWindow(void) {
 }
 
 - (void)rebuildSections {
-    _sectionTitles = @[@"消息防撤回", @"闪照设置", @"主页入口屏蔽", @"自定义电量", @"关于"];
+    _sectionTitles = @[@"消息防撤回", @"闪照设置", @"顶部搜索栏屏蔽", @"主页入口屏蔽", @"自定义电量", @"关于"];
     _sections = @[
         @[
             @{@"title": @"开启防撤回", @"key": @"antiRevoke", @"type": @"switch"},
             @{@"title": @"好友动态精准去广告", @"key": @"qzoneAdBlock", @"type": @"switch"},
         ],
         @[@{@"title": @"无限次查看闪照", @"key": @"flashUnlimited", @"type": @"switch"}],
+        @[
+            @{@"title": @"屏蔽首页搜索栏",   @"key": @"hideHomeSearch",    @"type": @"switch"},
+            @{@"title": @"屏蔽联系人搜索栏", @"key": @"hideContactSearch", @"type": @"switch"},
+            @{@"title": @"屏蔽动态搜索栏",   @"key": @"hideDynamicSearch", @"type": @"switch"},
+        ],
         @[
             @{@"title": @"隐藏「相册」",     @"key": @"drawerHideAlbum",    @"type": @"switch"},
             @{@"title": @"隐藏「收藏」",     @"key": @"drawerHideFavorite", @"type": @"switch"},
@@ -256,7 +271,7 @@ static UIWindow *activeForegroundWindow(void) {
             @{@"title": @"电量 (0~100)", @"key": @"batteryLevel", @"type": @"number"},
             @{@"title": @"模拟充电中", @"key": @"isCharging", @"type": @"switch"},
         ],
-        @[@{@"title": @"QQESign v2.2\n适配NT架构 · 防撤回持久化 · 闪照无限查看\n自定义电量", @"type": @"info"}],
+        @[@{@"title": @"QQESign v2.4\n适配NT架构 · 防撤回持久化 · 闪照无限查看\n自定义电量 · 顶部搜索栏屏蔽", @"type": @"info"}],
     ];
 }
 
@@ -345,6 +360,10 @@ static UIWindow *activeForegroundWindow(void) {
     if ([key hasPrefix:@"drawerHide"]) {
         // 抽屉入口屏蔽开关变化: 清空已标记 model, 下次抽屉重新展开时按新设置评估
         qqesignDrawerClearAllBlockedModels();
+    }
+    if ([key isEqualToString:@"hideHomeSearch"] || [key isEqualToString:@"hideContactSearch"] || [key isEqualToString:@"hideDynamicSearch"]) {
+        qqesignInstallTopSearchHooks("settings-switch");
+        QQELog(@"[QQESign] 顶部搜索栏屏蔽开关变更: home=%d contact=%d dynamic=%d", pref_hideHomeSearch, pref_hideContactSearch, pref_hideDynamicSearch);
     }
 }
 
@@ -1969,6 +1988,7 @@ static void qqesignInstallQZoneAdHooks(const char *reason) {
     if (!qqesignQZoneAdHooksFullyInstalled()) {
         qqesignInstallQZoneAdHooks("view-did-appear");
     }
+    qqesignInstallTopSearchHooks("view-did-appear");
 }
 
 %end
@@ -2305,6 +2325,638 @@ static void qqesignInstallDrawerHooks(const char *reason) {
     }
 }
 
+
+// ─────────────────────────────────────────────
+#pragma mark - 4.7 顶部搜索栏屏蔽：首页 / 联系人 / 动态
+// ─────────────────────────────────────────────
+
+static NSMutableSet<NSValue *> *qqesignHomeMarkedObjects = nil;
+
+static IMP qqesignOrigQUISearchDidMoveToSuperview = NULL;
+static IMP qqesignOrigQUISearchDidMoveToWindow = NULL;
+static IMP qqesignOrigHomeWrapperDidMoveToSuperview = NULL;
+static IMP qqesignOrigHomeWrapperLayoutSubviews = NULL;
+static IMP qqesignOrigHomeHeaderHeight = NULL;
+static IMP qqesignOrigTableSetHeader = NULL;
+
+static NSMutableSet<NSString *> *qqesignRelationLayoutHookedClasses = nil;
+static NSMapTable<id, NSValue *> *qqesignRelationLastBounds = nil;
+static NSHashTable<id> *qqesignRelationFixingObjects = nil;
+
+static NSString *qqesignObjClassName(id obj) {
+    if (!obj) return @"";
+    @try { return NSStringFromClass([obj class]) ?: @""; }
+    @catch (__unused NSException *e) { return @""; }
+}
+
+static BOOL qqesignObjClassContains(id obj, NSString *needle) {
+    return [qqesignObjClassName(obj) rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static BOOL qqesignClassNameContains(Class cls, NSString *needle) {
+    if (!cls) return NO;
+    NSString *name = NSStringFromClass(cls) ?: @"";
+    return [name rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static void qqesignSearchEnsureState(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        qqesignHomeMarkedObjects = [NSMutableSet set];
+        qqesignRelationLayoutHookedClasses = [NSMutableSet set];
+        qqesignRelationLastBounds = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory
+                                                           valueOptions:NSPointerFunctionsStrongMemory];
+        qqesignRelationFixingObjects = [NSHashTable weakObjectsHashTable];
+    });
+}
+
+static NSValue *qqesignObjPtrKey(id obj) {
+    return [NSValue valueWithPointer:(__bridge const void *)(obj)];
+}
+
+static BOOL qqesignClassOwnsInstanceMethod(Class cls, SEL sel);
+
+static BOOL qqesignHookInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
+    if (!cls || !sel || !newImp) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+
+    IMP oldImp = method_getImplementation(m);
+    const char *types = method_getTypeEncoding(m);
+    if (origOut && !*origOut) *origOut = oldImp;
+
+    if (qqesignClassOwnsInstanceMethod(cls, sel)) {
+        method_setImplementation(m, newImp);
+        return YES;
+    }
+
+    // If the method is inherited, add an override on this exact class.
+    // This avoids replacing UIView/UIScrollView implementations globally.
+    return class_addMethod(cls, sel, newImp, types);
+}
+
+static BOOL qqesignClassOwnsInstanceMethod(Class cls, SEL sel) {
+    if (!cls || !sel) return NO;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    BOOL owns = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) == sel) {
+            owns = YES;
+            break;
+        }
+    }
+    if (methods) free(methods);
+    return owns;
+}
+
+static id qqesignSuperview(id view) {
+    if (!view || ![view respondsToSelector:@selector(superview)]) return nil;
+    @try { return [view superview]; }
+    @catch (__unused NSException *e) { return nil; }
+}
+
+static NSArray<UIView *> *qqesignSubviews(UIView *view, NSUInteger maxCount) {
+    if (![view isKindOfClass:[UIView class]]) return @[];
+    @try {
+        NSArray *subs = [view subviews] ?: @[];
+        if (subs.count <= maxCount) return subs;
+        return [subs subarrayWithRange:NSMakeRange(0, maxCount)];
+    } @catch (__unused NSException *e) {
+        return @[];
+    }
+}
+
+static BOOL qqesignIsQUISearchBar(id view) {
+    return qqesignObjClassContains(view, @"QUISearchBar");
+}
+
+static BOOL qqesignViewHasQUISearchBar(UIView *view, NSInteger depth) {
+    if (!view || depth > 4) return NO;
+    if (qqesignIsQUISearchBar(view)) return YES;
+    for (UIView *sub in qqesignSubviews(view, 24)) {
+        if (qqesignViewHasQUISearchBar(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static id qqesignFindAncestor(id view, NSString *needle, NSInteger maxDepth) {
+    id cur = view;
+    for (NSInteger i = 0; cur && i < maxDepth; i++) {
+        if (qqesignObjClassContains(cur, needle)) return cur;
+        cur = qqesignSuperview(cur);
+    }
+    return nil;
+}
+
+static void qqesignHideView(UIView *view) {
+    if (![view isKindOfClass:[UIView class]]) return;
+    @try {
+        view.hidden = YES;
+        view.alpha = 0.0;
+        view.userInteractionEnabled = NO;
+    } @catch (__unused NSException *e) {}
+}
+
+static void qqesignSetViewFrame(UIView *view, CGRect frame) {
+    if (![view isKindOfClass:[UIView class]]) return;
+    @try { view.frame = frame; }
+    @catch (__unused NSException *e) {}
+}
+
+static void qqesignSetFlexibleSize(UIView *view) {
+    if (![view isKindOfClass:[UIView class]]) return;
+    @try { view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; }
+    @catch (__unused NSException *e) {}
+}
+
+// ───── 首页 ─────
+
+static id qqesignNearestHomeListFromWrapper(id wrapper) {
+    id cur = qqesignSuperview(wrapper);
+    for (NSInteger i = 0; cur && i < 10; i++) {
+        if (qqesignObjClassContains(cur, @"NTMsgListViewDeprecated")) return cur;
+        cur = qqesignSuperview(cur);
+    }
+    return nil;
+}
+
+static id qqesignNearestReloadableAncestor(id view) {
+    id cur = view;
+    for (NSInteger i = 0; cur && i < 10; i++) {
+        @try {
+            if ([cur respondsToSelector:@selector(reloadData)]) return cur;
+        } @catch (__unused NSException *e) {}
+        cur = qqesignSuperview(cur);
+    }
+    return nil;
+}
+
+static void qqesignReloadIfPossible(id obj) {
+    if (!obj) return;
+    @try {
+        if ([obj respondsToSelector:@selector(reloadData)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [obj performSelector:@selector(reloadData)];
+#pragma clang diagnostic pop
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+static BOOL qqesignCollapseHomeWrapper(UIView *wrapper, const char *source) {
+    if (![wrapper isKindOfClass:[UIView class]]) return NO;
+    qqesignHideView(wrapper);
+    wrapper.clipsToBounds = YES;
+
+    @try {
+        CGRect f = wrapper.frame;
+        if (CGRectGetHeight(f) > 1.0 || fabs(CGRectGetMinY(f)) > 1.0) {
+            f.origin.y = 0;
+            f.size.height = 0.01;
+            qqesignSetViewFrame(wrapper, f);
+            QQELog(@"[QQESign] home search wrapper collapsed src=%s class=%@", source ?: "", qqesignObjClassName(wrapper));
+        }
+
+        for (UIView *sub in qqesignSubviews(wrapper, 16)) {
+            qqesignHideView(sub);
+            CGRect sf = sub.frame;
+            if (CGRectGetHeight(sf) > 1.0) {
+                sf.origin.y = 0;
+                sf.size.height = 0.01;
+                qqesignSetViewFrame(sub, sf);
+            }
+        }
+    } @catch (__unused NSException *e) {}
+
+    return YES;
+}
+
+static void qqesignMarkHomeListFromWrapper(UIView *wrapper, const char *source) {
+    if (!pref_hideHomeSearch || !wrapper) return;
+    qqesignSearchEnsureState();
+    qqesignCollapseHomeWrapper(wrapper, source);
+
+    id list = qqesignNearestHomeListFromWrapper(wrapper);
+    if (list) {
+        [qqesignHomeMarkedObjects addObject:qqesignObjPtrKey(list)];
+    }
+
+    id reloadable = qqesignNearestReloadableAncestor(wrapper);
+    if (reloadable) {
+        [qqesignHomeMarkedObjects addObject:qqesignObjPtrKey(reloadable)];
+    }
+
+    if (!list && !reloadable) return;
+
+    for (NSInteger idx = 0; idx < 3; idx++) {
+        NSTimeInterval delay = (idx == 0) ? 0.0 : (idx == 1 ? 0.08 : 0.24);
+        __weak UIView *weakWrapper = wrapper;
+        __weak id weakList = list;
+        __weak id weakReloadable = reloadable;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIView *strongWrapper = weakWrapper;
+            if (strongWrapper) qqesignCollapseHomeWrapper(strongWrapper, source);
+            qqesignReloadIfPossible(weakList);
+            if (weakReloadable && weakReloadable != weakList) qqesignReloadIfPossible(weakReloadable);
+        });
+    }
+}
+
+static BOOL qqesignHandleHomeSearchBar(UIView *bar, const char *source) {
+    if (!pref_hideHomeSearch || !bar) return NO;
+    UIView *wrapper = qqesignFindAncestor(bar, @"NTListViewHeaderWrapper", 8);
+    if (![wrapper isKindOfClass:[UIView class]]) return NO;
+    if (!qqesignViewHasQUISearchBar(wrapper, 0)) return NO;
+
+    qqesignCollapseHomeWrapper(wrapper, source);
+    qqesignMarkHomeListFromWrapper(wrapper, source);
+    return YES;
+}
+
+static void qqesignHomeWrapperDidMoveReplacement(id selfObj, SEL _cmd) {
+    if (qqesignOrigHomeWrapperDidMoveToSuperview) {
+        ((void (*)(id, SEL))qqesignOrigHomeWrapperDidMoveToSuperview)(selfObj, _cmd);
+    }
+    if (pref_hideHomeSearch && [selfObj isKindOfClass:[UIView class]] && qqesignViewHasQUISearchBar(selfObj, 0)) {
+        qqesignMarkHomeListFromWrapper(selfObj, "home-wrapper-didMove");
+    }
+}
+
+static void qqesignHomeWrapperLayoutReplacement(id selfObj, SEL _cmd) {
+    if (qqesignOrigHomeWrapperLayoutSubviews) {
+        ((void (*)(id, SEL))qqesignOrigHomeWrapperLayoutSubviews)(selfObj, _cmd);
+    }
+    if (pref_hideHomeSearch && [selfObj isKindOfClass:[UIView class]] && qqesignViewHasQUISearchBar(selfObj, 0)) {
+        qqesignCollapseHomeWrapper(selfObj, "home-wrapper-layout");
+    }
+}
+
+static CGFloat qqesignHomeHeaderHeightReplacement(id selfObj, SEL _cmd, id collectionView, id indexPath) {
+    if (pref_hideHomeSearch) {
+        qqesignSearchEnsureState();
+        if ([qqesignHomeMarkedObjects containsObject:qqesignObjPtrKey(selfObj)] ||
+            [qqesignHomeMarkedObjects containsObject:qqesignObjPtrKey(collectionView)]) {
+            return 0.01;
+        }
+    }
+
+    if (qqesignOrigHomeHeaderHeight) {
+        return ((CGFloat (*)(id, SEL, id, id))qqesignOrigHomeHeaderHeight)(selfObj, _cmd, collectionView, indexPath);
+    }
+    return 0.0;
+}
+
+// ───── 动态 ─────
+
+static BOOL qqesignIsDynamicTable(id table) {
+    return qqesignObjClassContains(table, @"QQDynamicPluginTableView");
+}
+
+static BOOL qqesignRemoveDynamicHeaderIfNeeded(UITableView *table, const char *source) {
+    if (!pref_hideDynamicSearch || ![table isKindOfClass:[UITableView class]]) return NO;
+    if (!qqesignIsDynamicTable(table)) return NO;
+
+    UIView *header = nil;
+    @try { header = table.tableHeaderView; } @catch (__unused NSException *e) {}
+    if (!header || !qqesignViewHasQUISearchBar(header, 0)) return NO;
+
+    qqesignHideView(header);
+    @try { table.tableHeaderView = nil; } @catch (__unused NSException *e) {}
+    QQELog(@"[QQESign] dynamic search header removed src=%s", source ?: "");
+    return YES;
+}
+
+static void qqesignTableSetHeaderReplacement(UITableView *selfObj, SEL _cmd, UIView *header) {
+    if (pref_hideDynamicSearch && qqesignIsDynamicTable(selfObj) && header && qqesignViewHasQUISearchBar(header, 0)) {
+        qqesignHideView(header);
+        if (qqesignOrigTableSetHeader) {
+            ((void (*)(id, SEL, id))qqesignOrigTableSetHeader)(selfObj, _cmd, nil);
+        }
+        QQELog(@"[QQESign] dynamic setTableHeaderView blocked");
+        return;
+    }
+
+    if (qqesignOrigTableSetHeader) {
+        ((void (*)(id, SEL, id))qqesignOrigTableSetHeader)(selfObj, _cmd, header);
+    }
+}
+
+// ───── 联系人 ─────
+
+static BOOL qqesignIsRelationSearchContext(UIView *bar) {
+    if (!pref_hideContactSearch || !bar) return NO;
+    id cur = qqesignSuperview(bar);
+    for (NSInteger i = 0; cur && i < 8; i++) {
+        if (qqesignObjClassContains(cur, @"QQRelationTabScrollView")) return YES;
+        cur = qqesignSuperview(cur);
+    }
+    return NO;
+}
+
+static UIView *qqesignRelationContainerFromBar(UIView *bar) {
+    id cur = qqesignSuperview(bar);
+    for (NSInteger i = 0; cur && i < 8; i++) {
+        if (qqesignObjClassContains(cur, @"QQRelationTabScrollView") && [cur isKindOfClass:[UIView class]]) {
+            return cur;
+        }
+        cur = qqesignSuperview(cur);
+    }
+    return nil;
+}
+
+static void qqesignHideRelationBar(UIView *bar, UIView *relation, const char *source) {
+    if (![bar isKindOfClass:[UIView class]] || ![relation isKindOfClass:[UIView class]]) return;
+    qqesignHideView(bar);
+    CGRect rb = relation.bounds;
+    if (CGRectGetWidth(rb) <= 0 || CGRectGetHeight(rb) <= 0) rb = relation.frame;
+    if (CGRectGetWidth(rb) <= 0) rb.size.width = [UIScreen mainScreen].bounds.size.width;
+    bar.frame = CGRectMake(0, 0, rb.size.width, 0.01);
+}
+
+static void qqesignTuneScrollView(UIScrollView *scroll) {
+    if (![scroll isKindOfClass:[UIScrollView class]]) return;
+    @try {
+        UIEdgeInsets inset = scroll.contentInset;
+        if (fabs(inset.top) > 0.5) {
+            inset.top = 0;
+            scroll.contentInset = inset;
+        }
+        UIEdgeInsets indicator = scroll.scrollIndicatorInsets;
+        if (fabs(indicator.top) > 0.5) {
+            indicator.top = 0;
+            scroll.scrollIndicatorInsets = indicator;
+        }
+        CGPoint off = scroll.contentOffset;
+        if (off.y < 0 && off.y > -180) {
+            off.y = 0;
+            scroll.contentOffset = off;
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+static void qqesignFindRelationBarAndContent(UIView *relation, UIView **outBar, UIView **outContent) {
+    if (outBar) *outBar = nil;
+    if (outContent) *outContent = nil;
+    if (![relation isKindOfClass:[UIView class]]) return;
+
+    NSArray *subs = qqesignSubviews(relation, 16);
+    UIView *bar = nil;
+    UIView *content = nil;
+
+    for (UIView *v in subs) {
+        if (qqesignIsQUISearchBar(v)) {
+            bar = v;
+            break;
+        }
+    }
+
+    for (UIView *v in subs) {
+        if (v == bar) continue;
+        NSString *name = qqesignObjClassName(v);
+        if ([name rangeOfString:@"_UIScrollViewScrollIndicator"].location != NSNotFound) continue;
+        content = v;
+        break;
+    }
+
+    if (outBar) *outBar = bar;
+    if (outContent) *outContent = content;
+}
+
+static void qqesignFillRelationContentChildren(UIView *content, const char *source) {
+    if (![content isKindOfClass:[UIView class]]) return;
+    CGRect cb = content.bounds;
+    if (CGRectGetWidth(cb) <= 0 || CGRectGetHeight(cb) <= 0) cb = content.frame;
+    if (CGRectGetWidth(cb) <= 0 || CGRectGetHeight(cb) <= 0) return;
+
+    for (UIView *v in qqesignSubviews(content, 16)) {
+        NSString *name = qqesignObjClassName(v);
+        if ([name rangeOfString:@"_UIScrollViewScrollIndicator"].location != NSNotFound) continue;
+
+        if ([v isKindOfClass:[UIScrollView class]]) {
+            qqesignTuneScrollView((UIScrollView *)v);
+        }
+
+        CGRect f = v.frame;
+        BOOL shouldFill = [v isKindOfClass:[UIScrollView class]] ||
+                          (CGRectGetMinY(f) > 0 && CGRectGetMinY(f) < 180 && fabs(CGRectGetHeight(f) - CGRectGetHeight(cb)) < 220);
+        if (!shouldFill) continue;
+
+        if (fabs(CGRectGetMinX(f)) < 2 &&
+            fabs(CGRectGetMinY(f)) < 2 &&
+            fabs(CGRectGetWidth(f) - CGRectGetWidth(cb)) < 2 &&
+            fabs(CGRectGetHeight(f) - CGRectGetHeight(cb)) < 2) {
+            continue;
+        }
+
+        qqesignSetViewFrame(v, CGRectMake(0, 0, CGRectGetWidth(cb), CGRectGetHeight(cb)));
+        qqesignSetFlexibleSize(v);
+    }
+}
+
+static BOOL qqesignFixRelationView(UIView *relation, const char *source) {
+    if (!pref_hideContactSearch || ![relation isKindOfClass:[UIView class]]) return NO;
+    if (!qqesignObjClassContains(relation, @"QQRelationTabScrollView")) return NO;
+
+    qqesignSearchEnsureState();
+    if ([qqesignRelationFixingObjects containsObject:relation]) return NO;
+    [qqesignRelationFixingObjects addObject:relation];
+
+    @try {
+        CGRect rb = relation.bounds;
+        if (CGRectGetWidth(rb) <= 0 || CGRectGetHeight(rb) <= 0) rb = relation.frame;
+        if (CGRectGetWidth(rb) <= 0 || CGRectGetHeight(rb) <= 0) {
+            [qqesignRelationFixingObjects removeObject:relation];
+            return NO;
+        }
+
+        [qqesignRelationLastBounds setObject:[NSValue valueWithCGRect:rb] forKey:relation];
+
+        UIView *bar = nil;
+        UIView *content = nil;
+        qqesignFindRelationBarAndContent(relation, &bar, &content);
+        if (!bar || !content) {
+            [qqesignRelationFixingObjects removeObject:relation];
+            return NO;
+        }
+
+        qqesignHideRelationBar(bar, relation, source);
+
+        CGRect cf = content.frame;
+        BOOL needFill = fabs(CGRectGetMinX(cf)) > 1 ||
+                        fabs(CGRectGetMinY(cf)) > 1 ||
+                        fabs(CGRectGetWidth(cf) - CGRectGetWidth(rb)) > 2 ||
+                        fabs(CGRectGetHeight(cf) - CGRectGetHeight(rb)) > 2;
+
+        if (needFill) {
+            qqesignSetViewFrame(content, CGRectMake(0, 0, CGRectGetWidth(rb), CGRectGetHeight(rb)));
+            qqesignSetFlexibleSize(content);
+            QQELog(@"[QQESign] relation search content filled src=%s class=%@", source ?: "", qqesignObjClassName(content));
+        }
+
+        qqesignFillRelationContentChildren(content, source);
+        [qqesignRelationFixingObjects removeObject:relation];
+        return YES;
+    } @catch (__unused NSException *e) {
+        [qqesignRelationFixingObjects removeObject:relation];
+        return NO;
+    }
+}
+
+static const void *kQQESignRelationOrigLayoutImpKey = &kQQESignRelationOrigLayoutImpKey;
+
+static void qqesignRelationLayoutThunk(id selfObj, SEL _cmd) {
+    IMP orig = NULL;
+    Class cls = [selfObj class];
+    while (cls) {
+        NSValue *v = objc_getAssociatedObject(cls, kQQESignRelationOrigLayoutImpKey);
+        if (v) {
+            orig = [v pointerValue];
+            break;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    if (orig) ((void (*)(id, SEL))orig)(selfObj, _cmd);
+    if (pref_hideContactSearch && [selfObj isKindOfClass:[UIView class]]) {
+        qqesignFixRelationView((UIView *)selfObj, "relation-layout");
+    }
+}
+
+static void qqesignInstallRelationLayoutHookForView(UIView *relation) {
+    if (!pref_hideContactSearch || !relation) return;
+    qqesignSearchEnsureState();
+
+    Class cls = [relation class];
+    while (cls && qqesignClassNameContains(cls, @"QQRelationTabScrollView")) {
+        NSString *className = NSStringFromClass(cls) ?: @"";
+        if ([qqesignRelationLayoutHookedClasses containsObject:className]) return;
+
+        SEL sel = @selector(layoutSubviews);
+        if (qqesignClassOwnsInstanceMethod(cls, sel)) {
+            Method m = class_getInstanceMethod(cls, sel);
+            if (!m) return;
+
+            IMP orig = method_getImplementation(m);
+            objc_setAssociatedObject(cls, kQQESignRelationOrigLayoutImpKey, [NSValue valueWithPointer:orig], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            method_setImplementation(m, (IMP)qqesignRelationLayoutThunk);
+            [qqesignRelationLayoutHookedClasses addObject:className];
+            QQELog(@"[QQESign] relation layout hooked class=%@", className);
+            return;
+        }
+
+        cls = class_getSuperclass(cls);
+    }
+}
+
+static void qqesignScheduleRelationFix(UIView *relation, const char *source) {
+    if (!pref_hideContactSearch || !relation) return;
+    qqesignInstallRelationLayoutHookForView(relation);
+
+    NSArray<NSNumber *> *delays = @[@0, @60, @180, @420, @900];
+    for (NSNumber *ms in delays) {
+        __weak UIView *weakRelation = relation;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms.doubleValue / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIView *r = weakRelation;
+            if (r) qqesignFixRelationView(r, source);
+        });
+    }
+}
+
+static BOOL qqesignHandleRelationSearchBar(UIView *bar, const char *source) {
+    if (!pref_hideContactSearch || !qqesignIsRelationSearchContext(bar)) return NO;
+    UIView *relation = qqesignRelationContainerFromBar(bar);
+    if (![relation isKindOfClass:[UIView class]]) return NO;
+    if (!qqesignObjClassContains(relation, @"QQRelationTabScrollView")) return NO;
+
+    qqesignFixRelationView(relation, source);
+    qqesignScheduleRelationFix(relation, source);
+    return YES;
+}
+
+// ───── 统一 QUISearchBar 入口 ─────
+
+static void qqesignHandleTopSearchBar(UIView *bar, const char *source) {
+    if (![bar isKindOfClass:[UIView class]]) return;
+    if (!qqesignIsQUISearchBar(bar)) return;
+
+    if (pref_hideDynamicSearch) {
+        id dynamicTable = qqesignFindAncestor(bar, @"QQDynamicPluginTableView", 8);
+        if ([dynamicTable isKindOfClass:[UITableView class]]) {
+            qqesignRemoveDynamicHeaderIfNeeded(dynamicTable, source);
+            return;
+        }
+    }
+
+    if (pref_hideHomeSearch && qqesignHandleHomeSearchBar(bar, source)) return;
+    if (pref_hideContactSearch) qqesignHandleRelationSearchBar(bar, source);
+}
+
+static void qqesignQUISearchDidMoveToSuperviewReplacement(id selfObj, SEL _cmd) {
+    if (qqesignOrigQUISearchDidMoveToSuperview) {
+        ((void (*)(id, SEL))qqesignOrigQUISearchDidMoveToSuperview)(selfObj, _cmd);
+    }
+    if (pref_hideHomeSearch || pref_hideContactSearch || pref_hideDynamicSearch) {
+        qqesignHandleTopSearchBar(selfObj, "searchbar-didMoveToSuperview");
+    }
+}
+
+static void qqesignQUISearchDidMoveToWindowReplacement(id selfObj, SEL _cmd) {
+    if (qqesignOrigQUISearchDidMoveToWindow) {
+        ((void (*)(id, SEL))qqesignOrigQUISearchDidMoveToWindow)(selfObj, _cmd);
+    }
+    if (pref_hideHomeSearch || pref_hideContactSearch || pref_hideDynamicSearch) {
+        qqesignHandleTopSearchBar(selfObj, "searchbar-didMoveToWindow");
+    }
+}
+
+static BOOL gQQESignTopSearchHooksInstalled = NO;
+
+static void qqesignInstallTopSearchHooks(const char *reason) {
+    qqesignSearchEnsureState();
+
+    BOOL installedAny = NO;
+
+    Class searchBarCls = objc_getClass("QUISearchBar");
+    if (searchBarCls) {
+        if (!qqesignOrigQUISearchDidMoveToSuperview) {
+            installedAny |= qqesignHookInstanceMethod(searchBarCls, @selector(didMoveToSuperview), (IMP)qqesignQUISearchDidMoveToSuperviewReplacement, &qqesignOrigQUISearchDidMoveToSuperview);
+        }
+        if (!qqesignOrigQUISearchDidMoveToWindow) {
+            installedAny |= qqesignHookInstanceMethod(searchBarCls, @selector(didMoveToWindow), (IMP)qqesignQUISearchDidMoveToWindowReplacement, &qqesignOrigQUISearchDidMoveToWindow);
+        }
+    }
+
+    Class tableCls = [UITableView class];
+    if (!qqesignOrigTableSetHeader) {
+        installedAny |= qqesignHookInstanceMethod(tableCls, @selector(setTableHeaderView:), (IMP)qqesignTableSetHeaderReplacement, &qqesignOrigTableSetHeader);
+    }
+
+    Class homeWrapperCls = objc_getClass("NTListViewModule.NTListViewHeaderWrapper");
+    if (homeWrapperCls) {
+        if (!qqesignOrigHomeWrapperDidMoveToSuperview) {
+            installedAny |= qqesignHookInstanceMethod(homeWrapperCls, @selector(didMoveToSuperview), (IMP)qqesignHomeWrapperDidMoveReplacement, &qqesignOrigHomeWrapperDidMoveToSuperview);
+        }
+        if (!qqesignOrigHomeWrapperLayoutSubviews) {
+            installedAny |= qqesignHookInstanceMethod(homeWrapperCls, @selector(layoutSubviews), (IMP)qqesignHomeWrapperLayoutReplacement, &qqesignOrigHomeWrapperLayoutSubviews);
+        }
+    }
+
+    Class homeListCls = objc_getClass("NTMsgListViewDeprecated");
+    if (homeListCls && !qqesignOrigHomeHeaderHeight) {
+        installedAny |= qqesignHookInstanceMethod(homeListCls, @selector(collectionView:heightForHeaderAt:), (IMP)qqesignHomeHeaderHeightReplacement, &qqesignOrigHomeHeaderHeight);
+    }
+
+    if (installedAny) {
+        gQQESignTopSearchHooksInstalled = YES;
+        QQELog(@"[QQESign] top-search hooks installed reason=%s home=%d contact=%d dynamic=%d",
+                reason ?: "unknown",
+                pref_hideHomeSearch,
+                pref_hideContactSearch,
+                pref_hideDynamicSearch);
+    }
+}
+
+
 #pragma mark - 5. 设置入口
 // ─────────────────────────────────────────────
 
@@ -2396,10 +3048,13 @@ static void qqesign_installNetworkHooks(void) {
         %init(QZoneAdBlockLazyEntry);
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallQZoneAdHooks("ctor");
+        qqesignInstallTopSearchHooks("ctor");
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
-        NSLog(@"[QQESign] v2.3 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d fakeBatt=%d drawerHide=%d",
-              pref_antiRevoke, pref_flashUnlimited, pref_qzoneAdBlock, pref_fakeBattery,
+        NSLog(@"[QQESign] v2.4 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d topSearch(home=%d contact=%d dynamic=%d) fakeBatt=%d drawerHide=%d",
+              pref_antiRevoke, pref_flashUnlimited, pref_qzoneAdBlock,
+              pref_hideHomeSearch, pref_hideContactSearch, pref_hideDynamicSearch,
+              pref_fakeBattery,
               (pref_drawerHideAlbum || pref_drawerHideFavorite || pref_drawerHideFiles ||
                pref_drawerHideWallet || pref_drawerHideVip || pref_drawerHideDecor ||
                pref_drawerHideFreedata));
