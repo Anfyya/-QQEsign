@@ -101,11 +101,12 @@ static BOOL qqesignAnyTopSearchEnabled(void) {
 
 static void qqesignResetTopSearchPrefsDefaultOffOnce(NSUserDefaults *ud) {
     if (!ud) return;
-    if ([ud boolForKey:@"topSearchDefaultOffMigrated"]) return;
+    // v2 key: force old stored top-search values back to OFF once for this safe build.
+    if ([ud boolForKey:@"topSearchDefaultOffMigrated_v2"]) return;
     [ud setBool:NO forKey:@"hideHomeSearch"];
     [ud setBool:NO forKey:@"hideContactSearch"];
     [ud setBool:NO forKey:@"hideDynamicSearch"];
-    [ud setBool:YES forKey:@"topSearchDefaultOffMigrated"];
+    [ud setBool:YES forKey:@"topSearchDefaultOffMigrated_v2"];
     [ud synchronize];
 }
 
@@ -377,10 +378,10 @@ static UIWindow *activeForegroundWindow(void) {
         qqesignDrawerClearAllBlockedModels();
     }
     if ([key isEqualToString:@"hideHomeSearch"] || [key isEqualToString:@"hideContactSearch"] || [key isEqualToString:@"hideDynamicSearch"]) {
-        if (qqesignAnyTopSearchEnabled()) {
-            qqesignInstallTopSearchHooks("settings-switch");
-        }
-        QQELog(@"[QQESign] 顶部搜索栏屏蔽开关变更: home=%d contact=%d dynamic=%d", pref_hideHomeSearch, pref_hideContactSearch, pref_hideDynamicSearch);
+        // Do NOT install top-search hooks immediately inside Settings.
+        // Installing runtime method replacements while QQ is already building UI can crash on some versions.
+        // The new value takes effect after restarting QQ.
+        QQELog(@"[QQESign] top-search pref changed, restart QQ to apply: home=%d contact=%d dynamic=%d", pref_hideHomeSearch, pref_hideContactSearch, pref_hideDynamicSearch);
     }
 }
 
@@ -2005,9 +2006,7 @@ static void qqesignInstallQZoneAdHooks(const char *reason) {
     if (!qqesignQZoneAdHooksFullyInstalled()) {
         qqesignInstallQZoneAdHooks("view-did-appear");
     }
-    if (qqesignAnyTopSearchEnabled()) {
-        qqesignInstallTopSearchHooks("view-did-appear");
-    }
+    // top-search hooks are installed only once after launch, not from viewDidAppear.
 }
 
 %end
@@ -2842,29 +2841,11 @@ static void qqesignRelationLayoutThunk(id selfObj, SEL _cmd) {
 }
 
 static void qqesignInstallRelationLayoutHookForView(UIView *relation) {
-    if (!pref_hideContactSearch || !relation) return;
-    qqesignSearchEnsureState();
-
-    Class cls = [relation class];
-    while (cls && qqesignClassNameContains(cls, @"QQRelationTabScrollView")) {
-        NSString *className = NSStringFromClass(cls) ?: @"";
-        if ([qqesignRelationLayoutHookedClasses containsObject:className]) return;
-
-        SEL sel = @selector(layoutSubviews);
-        if (qqesignClassOwnsInstanceMethod(cls, sel)) {
-            Method m = class_getInstanceMethod(cls, sel);
-            if (!m) return;
-
-            IMP orig = method_getImplementation(m);
-            objc_setAssociatedObject(cls, kQQESignRelationOrigLayoutImpKey, [NSValue valueWithPointer:orig], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            method_setImplementation(m, (IMP)qqesignRelationLayoutThunk);
-            [qqesignRelationLayoutHookedClasses addObject:className];
-            QQELog(@"[QQESign] relation layout hooked class=%@", className);
-            return;
-        }
-
-        cls = class_getSuperclass(cls);
-    }
+    // Disabled in safe build.
+    // The scheduled relation fixes are enough for the validated layout,
+    // and avoiding extra layoutSubviews swizzling reduces crash risk.
+    (void)relation;
+    return;
 }
 
 static void qqesignScheduleRelationFix(UIView *relation, const char *source) {
@@ -3073,8 +3054,8 @@ static void qqesign_installNetworkHooks(void) {
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallQZoneAdHooks("ctor");
         if (qqesignAnyTopSearchEnabled()) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                qqesignInstallTopSearchHooks("post-launch");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                qqesignInstallTopSearchHooks("post-launch-safe");
             });
         }
         qqesignInstallRecallHooksWithRetry();
