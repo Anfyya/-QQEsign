@@ -45,9 +45,9 @@ static NSString *const kPrefSuite = @"com.qqesign.prefs";
 static BOOL   pref_antiRevoke     = YES;
 static BOOL   pref_flashUnlimited = YES;
 static BOOL   pref_qzoneAdBlock   = YES;
-static BOOL   pref_hideHomeSearch    = YES;
-static BOOL   pref_hideContactSearch = YES;
-static BOOL   pref_hideDynamicSearch = YES;
+static BOOL   pref_hideHomeSearch    = NO;
+static BOOL   pref_hideContactSearch = NO;
+static BOOL   pref_hideDynamicSearch = NO;
 static BOOL   pref_fakeBattery    = NO;
 static float  pref_batteryLevel   = 0.80f;
 static BOOL   pref_isCharging     = NO;
@@ -70,9 +70,9 @@ static NSUserDefaults *tweakDefaults(void) {
             @"antiRevoke":          @YES,
             @"flashUnlimited":      @YES,
             @"qzoneAdBlock":        @YES,
-            @"hideHomeSearch":      @YES,
-            @"hideContactSearch":   @YES,
-            @"hideDynamicSearch":   @YES,
+            @"hideHomeSearch":      @NO,
+            @"hideContactSearch":   @NO,
+            @"hideDynamicSearch":   @NO,
             @"fakeBattery":         @NO,
             @"batteryLevel":        @0.80f,
             @"isCharging":          @NO,
@@ -95,8 +95,23 @@ static void qqesignInstallDrawerHooks(const char *reason);
 static void qqesignDrawerClearAllBlockedModels(void);
 static void qqesignInstallTopSearchHooks(const char *reason);
 
+static BOOL qqesignAnyTopSearchEnabled(void) {
+    return pref_hideHomeSearch || pref_hideContactSearch || pref_hideDynamicSearch;
+}
+
+static void qqesignResetTopSearchPrefsDefaultOffOnce(NSUserDefaults *ud) {
+    if (!ud) return;
+    if ([ud boolForKey:@"topSearchDefaultOffMigrated"]) return;
+    [ud setBool:NO forKey:@"hideHomeSearch"];
+    [ud setBool:NO forKey:@"hideContactSearch"];
+    [ud setBool:NO forKey:@"hideDynamicSearch"];
+    [ud setBool:YES forKey:@"topSearchDefaultOffMigrated"];
+    [ud synchronize];
+}
+
 static void loadPrefs(void) {
     NSUserDefaults *ud = tweakDefaults();
+    qqesignResetTopSearchPrefsDefaultOffOnce(ud);
     pref_antiRevoke     = [ud boolForKey:@"antiRevoke"];
     pref_flashUnlimited = [ud boolForKey:@"flashUnlimited"];
     pref_qzoneAdBlock   = [ud boolForKey:@"qzoneAdBlock"];
@@ -362,7 +377,9 @@ static UIWindow *activeForegroundWindow(void) {
         qqesignDrawerClearAllBlockedModels();
     }
     if ([key isEqualToString:@"hideHomeSearch"] || [key isEqualToString:@"hideContactSearch"] || [key isEqualToString:@"hideDynamicSearch"]) {
-        qqesignInstallTopSearchHooks("settings-switch");
+        if (qqesignAnyTopSearchEnabled()) {
+            qqesignInstallTopSearchHooks("settings-switch");
+        }
         QQELog(@"[QQESign] 顶部搜索栏屏蔽开关变更: home=%d contact=%d dynamic=%d", pref_hideHomeSearch, pref_hideContactSearch, pref_hideDynamicSearch);
     }
 }
@@ -1988,7 +2005,9 @@ static void qqesignInstallQZoneAdHooks(const char *reason) {
     if (!qqesignQZoneAdHooksFullyInstalled()) {
         qqesignInstallQZoneAdHooks("view-did-appear");
     }
-    qqesignInstallTopSearchHooks("view-did-appear");
+    if (qqesignAnyTopSearchEnabled()) {
+        qqesignInstallTopSearchHooks("view-did-appear");
+    }
 }
 
 %end
@@ -2912,12 +2931,13 @@ static void qqesignQUISearchDidMoveToWindowReplacement(id selfObj, SEL _cmd) {
 static BOOL gQQESignTopSearchHooksInstalled = NO;
 
 static void qqesignInstallTopSearchHooks(const char *reason) {
+    if (!qqesignAnyTopSearchEnabled()) return;
     qqesignSearchEnsureState();
 
     BOOL installedAny = NO;
 
     Class searchBarCls = objc_getClass("QUISearchBar");
-    if (searchBarCls) {
+    if (searchBarCls && (pref_hideHomeSearch || pref_hideContactSearch || pref_hideDynamicSearch)) {
         if (!qqesignOrigQUISearchDidMoveToSuperview) {
             installedAny |= qqesignHookInstanceMethod(searchBarCls, @selector(didMoveToSuperview), (IMP)qqesignQUISearchDidMoveToSuperviewReplacement, &qqesignOrigQUISearchDidMoveToSuperview);
         }
@@ -2926,24 +2946,28 @@ static void qqesignInstallTopSearchHooks(const char *reason) {
         }
     }
 
-    Class tableCls = [UITableView class];
-    if (!qqesignOrigTableSetHeader) {
-        installedAny |= qqesignHookInstanceMethod(tableCls, @selector(setTableHeaderView:), (IMP)qqesignTableSetHeaderReplacement, &qqesignOrigTableSetHeader);
-    }
-
-    Class homeWrapperCls = objc_getClass("NTListViewModule.NTListViewHeaderWrapper");
-    if (homeWrapperCls) {
-        if (!qqesignOrigHomeWrapperDidMoveToSuperview) {
-            installedAny |= qqesignHookInstanceMethod(homeWrapperCls, @selector(didMoveToSuperview), (IMP)qqesignHomeWrapperDidMoveReplacement, &qqesignOrigHomeWrapperDidMoveToSuperview);
-        }
-        if (!qqesignOrigHomeWrapperLayoutSubviews) {
-            installedAny |= qqesignHookInstanceMethod(homeWrapperCls, @selector(layoutSubviews), (IMP)qqesignHomeWrapperLayoutReplacement, &qqesignOrigHomeWrapperLayoutSubviews);
+    if (pref_hideDynamicSearch) {
+        Class tableCls = [UITableView class];
+        if (tableCls && !qqesignOrigTableSetHeader) {
+            installedAny |= qqesignHookInstanceMethod(tableCls, @selector(setTableHeaderView:), (IMP)qqesignTableSetHeaderReplacement, &qqesignOrigTableSetHeader);
         }
     }
 
-    Class homeListCls = objc_getClass("NTMsgListViewDeprecated");
-    if (homeListCls && !qqesignOrigHomeHeaderHeight) {
-        installedAny |= qqesignHookInstanceMethod(homeListCls, @selector(collectionView:heightForHeaderAt:), (IMP)qqesignHomeHeaderHeightReplacement, &qqesignOrigHomeHeaderHeight);
+    if (pref_hideHomeSearch) {
+        Class homeWrapperCls = objc_getClass("NTListViewModule.NTListViewHeaderWrapper");
+        if (homeWrapperCls) {
+            if (!qqesignOrigHomeWrapperDidMoveToSuperview) {
+                installedAny |= qqesignHookInstanceMethod(homeWrapperCls, @selector(didMoveToSuperview), (IMP)qqesignHomeWrapperDidMoveReplacement, &qqesignOrigHomeWrapperDidMoveToSuperview);
+            }
+            if (!qqesignOrigHomeWrapperLayoutSubviews) {
+                installedAny |= qqesignHookInstanceMethod(homeWrapperCls, @selector(layoutSubviews), (IMP)qqesignHomeWrapperLayoutReplacement, &qqesignOrigHomeWrapperLayoutSubviews);
+            }
+        }
+
+        Class homeListCls = objc_getClass("NTMsgListViewDeprecated");
+        if (homeListCls && !qqesignOrigHomeHeaderHeight) {
+            installedAny |= qqesignHookInstanceMethod(homeListCls, @selector(collectionView:heightForHeaderAt:), (IMP)qqesignHomeHeaderHeightReplacement, &qqesignOrigHomeHeaderHeight);
+        }
     }
 
     if (installedAny) {
@@ -3048,7 +3072,11 @@ static void qqesign_installNetworkHooks(void) {
         %init(QZoneAdBlockLazyEntry);
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallQZoneAdHooks("ctor");
-        qqesignInstallTopSearchHooks("ctor");
+        if (qqesignAnyTopSearchEnabled()) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                qqesignInstallTopSearchHooks("post-launch");
+            });
+        }
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
         NSLog(@"[QQESign] v2.4 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d topSearch(home=%d contact=%d dynamic=%d) fakeBatt=%d drawerHide=%d",
