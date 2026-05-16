@@ -84,6 +84,7 @@ static NSUserDefaults *tweakDefaults(void) {
 
 static void qqesignClearModelAntiRecallRuntimeCache(void);
 static void qqesignInstallQZoneAdHooks(const char *reason);
+static BOOL qqesignQZoneAdHooksFullyInstalled(void);
 static void qqesignInstallDrawerHooks(const char *reason);
 static void qqesignDrawerClearAllBlockedModels(void);
 
@@ -1909,7 +1910,16 @@ static BOOL gQQESignQZonePresenterHooksInstalled = NO;
 static BOOL gQQESignQZoneCellHooksInstalled = NO;
 static BOOL gQQESignQZoneLayoutHooksInstalled = NO;
 
+static BOOL qqesignQZoneAdHooksFullyInstalled(void) {
+    return gQQESignQZoneControllerHooksInstalled &&
+           gQQESignQZonePresenterHooksInstalled &&
+           gQQESignQZoneCellHooksInstalled &&
+           gQQESignQZoneLayoutHooksInstalled;
+}
+
 static void qqesignInstallQZoneAdHooks(const char *reason) {
+    if (qqesignQZoneAdHooksFullyInstalled()) return;
+
     BOOL installed = NO;
 
     if (!gQQESignQZoneControllerHooksInstalled &&
@@ -1949,6 +1959,21 @@ static void qqesignInstallQZoneAdHooks(const char *reason) {
               gQQESignQZoneLayoutHooksInstalled);
     }
 }
+
+%group QZoneAdBlockLazyEntry
+
+%hook UIViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!qqesignQZoneAdHooksFullyInstalled()) {
+        qqesignInstallQZoneAdHooks("view-did-appear");
+    }
+}
+
+%end
+
+%end // %group QZoneAdBlockLazyEntry
 
 // ─────────────────────────────────────────────
 #pragma mark - 4.6 主页头像侧边抽屉入口屏蔽
@@ -2223,6 +2248,9 @@ static void qqesignDrawerInstallSubclassHook(NSString *className, UITableView *t
 
 - (void)reloadData {
     %orig;
+    if (!qqesignQZoneAdHooksFullyInstalled()) {
+        qqesignInstallQZoneAdHooks("table-reload");
+    }
     if (!qqesignDrawerAnyEnabled()) return;
     @try {
         id ds = [self dataSource];
@@ -2365,7 +2393,9 @@ static void qqesign_installNetworkHooks(void) {
     @autoreleasepool {
         loadPrefs();
         %init;
+        %init(QZoneAdBlockLazyEntry);
         NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
+        qqesignInstallQZoneAdHooks("ctor");
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
         NSLog(@"[QQESign] v2.3 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d fakeBatt=%d drawerHide=%d",
