@@ -2610,7 +2610,7 @@ static void qqesignHomeWrapperLayoutReplacement(id selfObj, SEL _cmd) {
     }
 }
 
-static CGFloat qqesignHomeHeaderHeightReplacement(id selfObj, SEL _cmd, id collectionView, id indexPath) {
+static CGFloat qqesignHomeHeaderHeightReplacement(id selfObj, SEL _cmd, id collectionView, NSInteger section) {
     if (pref_hideHomeSearch) {
         qqesignSearchEnsureState();
         if ([qqesignHomeMarkedObjects containsObject:qqesignObjPtrKey(selfObj)] ||
@@ -2620,7 +2620,7 @@ static CGFloat qqesignHomeHeaderHeightReplacement(id selfObj, SEL _cmd, id colle
     }
 
     if (qqesignOrigHomeHeaderHeight) {
-        return ((CGFloat (*)(id, SEL, id, id))qqesignOrigHomeHeaderHeight)(selfObj, _cmd, collectionView, indexPath);
+        return ((CGFloat (*)(id, SEL, id, NSInteger))qqesignOrigHomeHeaderHeight)(selfObj, _cmd, collectionView, section);
     }
     return 0.0;
 }
