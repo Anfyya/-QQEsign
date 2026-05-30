@@ -30,10 +30,12 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <stdarg.h>
 
 // ─────────────────────────────────────────────
@@ -45,6 +47,7 @@ static NSString *const kPrefSuite = @"com.qqesign.prefs";
 static BOOL   pref_antiRevoke     = YES;
 static BOOL   pref_flashUnlimited = YES;
 static BOOL   pref_qzoneAdBlock   = YES;
+static BOOL   pref_editText        = NO;   // 对方文本消息本地编辑（默认关）
 static BOOL   pref_hideHomeSearch    = NO;
 static BOOL   pref_hideContactSearch = NO;
 static BOOL   pref_hideDynamicSearch = NO;
@@ -70,6 +73,7 @@ static NSUserDefaults *tweakDefaults(void) {
             @"antiRevoke":          @YES,
             @"flashUnlimited":      @YES,
             @"qzoneAdBlock":        @YES,
+            @"editText":            @NO,
             @"hideHomeSearch":      @NO,
             @"hideContactSearch":   @NO,
             @"hideDynamicSearch":   @NO,
@@ -116,6 +120,7 @@ static void loadPrefs(void) {
     pref_antiRevoke     = [ud boolForKey:@"antiRevoke"];
     pref_flashUnlimited = [ud boolForKey:@"flashUnlimited"];
     pref_qzoneAdBlock   = [ud boolForKey:@"qzoneAdBlock"];
+    pref_editText       = [ud boolForKey:@"editText"];
     pref_hideHomeSearch    = [ud boolForKey:@"hideHomeSearch"];
     pref_hideContactSearch = [ud boolForKey:@"hideContactSearch"];
     pref_hideDynamicSearch = [ud boolForKey:@"hideDynamicSearch"];
@@ -131,66 +136,9 @@ static void loadPrefs(void) {
     pref_drawerHideFreedata = [ud boolForKey:@"drawerHideFreedata"];
 }
 
-static NSString *qqesignRuntimeLogPath(void) {
-    static NSString *path = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *base = dirs.firstObject ?: NSTemporaryDirectory();
-        path = [base stringByAppendingPathComponent:@"qqesign_runtime.log"];
-    });
-    return path;
-}
-
-static void qqesignAppendLogLine(NSString *line) {
-    if (line.length == 0) return;
-    static dispatch_queue_t logQueue = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        logQueue = dispatch_queue_create("com.qqesign.runtime.log", DISPATCH_QUEUE_SERIAL);
-    });
-
-    dispatch_async(logQueue, ^{
-        NSString *path = qqesignRuntimeLogPath();
-        if (path.length == 0) return;
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) {
-            [fm createFileAtPath:path contents:nil attributes:nil];
-        }
-        NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        if (!data) return;
-
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:data];
-        } @catch (__unused NSException *e) {
-        } @finally {
-            [fh closeFile];
-        }
-    });
-}
-
-static void qqesignLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
-static void qqesignLog(NSString *format, ...) {
-    if (!format) return;
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    if (msg.length == 0) return;
-
-    NSString *line = [NSString stringWithFormat:@"[%@] %@", [NSDate date], msg];
-    NSLog(@"%@", line);
-    qqesignAppendLogLine(line);
-}
-
-#define QQELog(...) qqesignLog(__VA_ARGS__)
-#define NSLog(...) qqesignLog(__VA_ARGS__)
+// 日志已全部移除：QQELog / NSLog 在本 tweak 内编译为空操作（无 console、无落盘）。
+#define QQELog(...) do {} while (0)
+#define NSLog(...) do {} while (0)
 
 // ─────────────────────────────────────────────
 #pragma mark - Helpers
@@ -266,6 +214,7 @@ static UIWindow *activeForegroundWindow(void) {
         @[
             @{@"title": @"开启防撤回", @"key": @"antiRevoke", @"type": @"switch"},
             @{@"title": @"好友动态精准去广告", @"key": @"qzoneAdBlock", @"type": @"switch"},
+            @{@"title": @"对方消息本地编辑(仅本机显示)", @"key": @"editText", @"type": @"switch"},
         ],
         @[@{@"title": @"无限次查看闪照", @"key": @"flashUnlimited", @"type": @"switch"}],
         @[
@@ -2962,6 +2911,517 @@ static void qqesignInstallTopSearchHooks(const char *reason) {
 }
 
 
+#pragma mark - 4.6 对方文本消息本地编辑 (移植自 AllCrash 研究脚本)
+// ─────────────────────────────────────────────
+//
+// 长按「对方发来的文本消息」→ 菜单出现「编辑」→ 仅修改本机 AIOTextView 的内容
+// 缓存 (_treeContent._intermediatedata._atrributedString)，不发网络、不动 OCMsgRecord。
+// 限制：
+//   1. 只对方消息——气泡为标准 BubbleView (NTAIOVASBubbleView)；自己消息
+//      (NTAIOBubbleDrawLayerView / 无标准气泡) 不注入编辑项。
+//   2. 只文本消息——能取到可编辑 attributedString 才注入。
+//   3. 只能缩减——新文本字符数必须 ≤ 原文且非空。
+// 安全口径沿用研究结论：不清 intermediatedata / truncate 字段（清了菜单复用 force-unwrap 崩），
+// 只清 drawInfo；菜单新项用 row=0 模板克隆，绝不让 Swift 用越界 row 索引 items 数组。
+
+static const NSInteger kQQEEditSection = 1;        // 菜单里编辑项所在 section
+static NSInteger gQQEMenuEditRow = -1;             // 动态编辑项 row(=原生项数)；-1=本次不注入
+static __weak UIView *gQQEEditTextView = nil;      // 本次长按命中的 AIOTextView
+static NSString *gQQEEditOriginal = nil;           // 命中文本原文
+static NSTimeInterval gQQEEditCaptureTs = 0;
+static BOOL gQQEEditCaptureOK = NO;
+static NSTimeInterval gQQEEditTriggerTs = 0;       // tap / didSelect 去抖
+static NSMutableDictionary<NSString *, NSString *> *gQQEEditsByOriginal = nil; // 原文 -> 新文本(供 cell 重绑补回)
+static char kQQEEditTapKey;
+static IMP gQQEOrigAIOBindViewModel = NULL;
+static BOOL gQQEEditMenuHooked = NO;
+
+static void qqeEditEnsureState(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gQQEEditsByOriginal = [NSMutableDictionary dictionary]; });
+}
+
+static void qqeMsgSendObj(id target, SEL sel, id arg) {
+    if (!target || !sel || ![target respondsToSelector:sel]) return;
+    @try { ((void (*)(id, SEL, id))objc_msgSend)(target, sel, arg); } @catch (__unused NSException *e) {}
+}
+static void qqeMsgSendInt(id target, SEL sel, NSInteger arg) {
+    if (!target || !sel || ![target respondsToSelector:sel]) return;
+    @try { ((void (*)(id, SEL, NSInteger))objc_msgSend)(target, sel, arg); } @catch (__unused NSException *e) {}
+}
+
+static BOOL qqeClassContains(id o, NSString *needle) {
+    if (!o) return NO;
+    NSString *n = NSStringFromClass([o class]);
+    return n.length > 0 && [n rangeOfString:needle].location != NSNotFound;
+}
+
+static NSString *qqeAttrPlain(id attr) {
+    if (!attr) return @"";
+    if ([attr isKindOfClass:[NSString class]]) return (NSString *)attr;
+    if ([attr isKindOfClass:[NSAttributedString class]]) {
+        NSString *s = [(NSAttributedString *)attr string];
+        return s ?: @"";
+    }
+    return @"";
+}
+
+static BOOL qqeIsEditableText(NSString *t) {
+    if (t.length == 0 || t.length > 800) return NO;
+    static NSSet *menuWords; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        menuWords = [NSSet setWithArray:@[@"复制", @"转发", @"收藏", @"删除", @"多选", @"引用", @"翻译", @"截图", @"装扮", @"编辑"]];
+    });
+    if ([menuWords containsObject:t]) return NO;
+    return YES;
+}
+
+static id qqeReadAttr(id inter) {
+    if (!inter) return nil;
+    id attr = qqeObjectIvar(inter, "_atrributedString");
+    if (!attr && [inter respondsToSelector:@selector(atrributedString)]) {
+        @try { attr = ((id (*)(id, SEL))objc_msgSend)(inter, @selector(atrributedString)); }
+        @catch (__unused NSException *e) {}
+    }
+    return attr;
+}
+
+static UIView *qqeFindAncestorCell(UIView *v) {
+    for (UIView *cur = v; cur; cur = cur.superview) {
+        if ([cur isKindOfClass:[UICollectionViewCell class]] || [cur isKindOfClass:[UITableViewCell class]]) return cur;
+    }
+    return nil;
+}
+
+static UIView *qqeFindSubviewContains(UIView *root, NSString *needle, int depth) {
+    if (!root || depth < 0) return nil;
+    if (qqeClassContains(root, needle)) return root;
+    for (UIView *sub in [root.subviews copy]) {
+        UIView *f = qqeFindSubviewContains(sub, needle, depth - 1);
+        if (f) return f;
+    }
+    return nil;
+}
+
+static UIView *qqeFindAncestorContains(UIView *v, NSString *needle, int maxDepth) {
+    int i = 0;
+    for (UIView *cur = v; cur && i < maxDepth; cur = cur.superview, i++) {
+        if (qqeClassContains(cur, needle)) return cur;
+    }
+    return nil;
+}
+
+static UIView *qqeFindFirstSubviewOfClass(UIView *root, Class cls) {
+    if (!root) return nil;
+    if ([root isKindOfClass:cls]) return root;
+    for (UIView *sub in [root.subviews copy]) {
+        UIView *f = qqeFindFirstSubviewOfClass(sub, cls);
+        if (f) return f;
+    }
+    return nil;
+}
+
+static UIView *qqeFindAIOTextView(UIView *pressed, UIView *cell) {
+    UIView *cur = pressed;
+    for (int i = 0; cur && i < 7; i++) {
+        if (qqeClassContains(cur, @"AIOTextView")) return cur;
+        if (cell && cur == cell) break;
+        cur = cur.superview;
+    }
+    if (cell) {
+        UIView *f = qqeFindSubviewContains(cell, @"AIOTextView", 8);
+        if (f) return f;
+    }
+    return nil;
+}
+
+// 对方气泡：rich 祖先里含「标准 BubbleView」(NTAIOVASBubbleView)；自己消息是
+// NTAIOBubbleDrawLayerView(不含 "BubbleView" 子串) / 无标准气泡 → 返回 NO。
+static BOOL qqeIsIncomingBubble(UIView *tv) {
+    UIView *rich = qqeFindAncestorContains(tv, @"NTAIORichTextContentView", 6);
+    if (!rich) return NO;
+    return qqeFindSubviewContains(rich, @"BubbleView", 3) != nil;
+}
+
+static NSString *qqeTextViewExtract(UIView *tv, id *outTree, id *outInter, id *outAttr) {
+    if (outTree) *outTree = nil;
+    if (outInter) *outInter = nil;
+    if (outAttr) *outAttr = nil;
+    if (!tv || !qqeClassContains(tv, @"AIOTextView")) return nil;
+    id tree = qqeObjectIvar(tv, "_treeContent");
+    id inter = tree ? qqeObjectIvar(tree, "_intermediatedata") : nil;
+    if (!tree || !inter) return nil;
+    id attr = qqeReadAttr(inter);
+    NSString *text = qqeAttrPlain(attr);
+    if (!qqeIsEditableText(text)) return nil;
+    if (outTree) *outTree = tree;
+    if (outInter) *outInter = inter;
+    if (outAttr) *outAttr = attr;
+    return text;
+}
+
+static CGSize qqeMeasureAttr(NSAttributedString *attr, NSString *oldText, NSString *newText, CGFloat oldWidth, CGFloat maxWidth) {
+    maxWidth = MAX(40, maxWidth > 0 ? maxWidth : (oldWidth > 0 ? oldWidth : 220));
+    CGFloat baseW = oldWidth > 0 ? oldWidth : 80;
+    CGFloat fallbackChar = MAX(7, MIN(18, baseW / MAX(1.0, (CGFloat)oldText.length)));
+    CGFloat fallbackW = MAX(18, MIN(maxWidth, ceil((CGFloat)newText.length * fallbackChar + 4)));
+    CGSize result = CGSizeMake(fallbackW, 24);
+    if ([attr isKindOfClass:[NSAttributedString class]]) {
+        @try {
+            CGRect r = [attr boundingRectWithSize:CGSizeMake(maxWidth, 10000)
+                                          options:(NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading)
+                                          context:nil];
+            if (r.size.width > 0 && r.size.height > 0) {
+                result.width = MIN(maxWidth, ceil(r.size.width + 4));
+                result.height = ceil(r.size.height + 4);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    return result;
+}
+
+static void qqeSetViewSizeKeepLeft(UIView *v, CGFloat w, CGFloat h) {
+    if (!v) return;
+    CGRect f = v.frame;
+    f.size.width = MAX(1, w);
+    f.size.height = MAX(1, h > 0 ? h : f.size.height);
+    @try { v.frame = f; } @catch (__unused NSException *e) {}
+}
+
+// 改完 attr 后手动缩气泡（对方气泡左对齐，保左边）。自带幂等守卫：已够小就不动 frame，
+// 避免 cell 重绑反复触发越缩越小。
+static void qqeAdjustBubble(UIView *tv, NSAttributedString *newAttr, NSString *oldText, NSString *newText) {
+    if (!tv) return;
+    CGRect tvFrame = tv.frame;
+    if (tvFrame.size.width <= 0) return;
+    UIView *rich = qqeFindAncestorContains(tv, @"NTAIORichTextContentView", 6);
+    UIView *bubble = rich ? qqeFindSubviewContains(rich, @"BubbleView", 3) : nil;
+    if (!bubble) return;   // 自己消息(DrawLayer)：不碰 frame
+    UIView *cellView = qqeFindAncestorContains(tv, @"NTAIOChatCellView", 6);
+    CGFloat maxWidth;
+    if (cellView && cellView.bounds.size.width > 0)
+        maxWidth = MAX(80, MIN(420, cellView.bounds.size.width * 0.68));
+    else
+        maxWidth = MAX(120, MIN(420, tvFrame.size.width * 2.2));
+
+    CGSize measured = qqeMeasureAttr(newAttr, oldText, newText, tvFrame.size.width, maxWidth);
+    CGFloat newTvW = MAX(18, measured.width);
+    CGFloat newTvH = MAX(tvFrame.size.height, measured.height);
+    if (tvFrame.size.width <= newTvW + 12) return;   // 幂等守卫
+
+    CGFloat oldTvW = MAX(1, tvFrame.size.width);
+    CGFloat oldTvH = MAX(1, tvFrame.size.height);
+
+    qqeSetViewSizeKeepLeft(tv, newTvW, newTvH);
+
+    CGRect rf = rich.frame;
+    if (rf.size.width > 0) {
+        CGFloat padW = MAX(0, rf.size.width - oldTvW);
+        CGFloat padH = MAX(0, rf.size.height - oldTvH);
+        qqeSetViewSizeKeepLeft(rich, newTvW + padW, MAX(rf.size.height, newTvH + padH));
+    }
+    CGRect bf = bubble.frame;
+    if (bf.size.width > 0) {
+        CGFloat padW = MAX(16, bf.size.width - oldTvW);
+        CGFloat padH = MAX(8, bf.size.height - oldTvH);
+        qqeSetViewSizeKeepLeft(bubble, newTvW + padW, MAX(bf.size.height, newTvH + padH));
+        for (UIView *sub in [bubble.subviews copy]) {
+            if (qqeClassContains(sub, @"ImageView") || qqeClassContains(sub, @"Bubble")) {
+                qqeSetViewSizeKeepLeft(sub, bubble.bounds.size.width, bubble.bounds.size.height);
+            }
+        }
+    }
+}
+
+static void qqeClearDrawInfo(id d) {
+    if (!d) return;
+    qqeMsgSendObj(d, @selector(setResult:), nil);
+    qqeMsgSendObj(d, @selector(setTextImage:), nil);
+    qqeMsgSendObj(d, @selector(setTextFrame:), nil);
+    qqeMsgSendObj(d, @selector(setFirstLine:), nil);
+    qqeMsgSendInt(d, @selector(setLineCount:), 0);
+}
+
+static NSAttributedString *qqeMakeReplacementAttr(id baseAttr, NSString *newText) {
+    NSString *ns = newText ?: @"";
+    NSDictionary *attrs = nil;
+    if ([baseAttr isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)baseAttr length] > 0) {
+        @try { attrs = [(NSAttributedString *)baseAttr attributesAtIndex:0 effectiveRange:NULL]; }
+        @catch (__unused NSException *e) {}
+    }
+    @try {
+        if (attrs) return [[NSMutableAttributedString alloc] initWithString:ns attributes:attrs];
+        return [[NSMutableAttributedString alloc] initWithString:ns];
+    } @catch (__unused NSException *e) { return nil; }
+}
+
+static void qqeForceRedraw(UIView *view) {
+    UIView *cur = view;
+    for (int i = 0; cur && i < 6; i++) {
+        @try {
+            [cur setNeedsDisplay];
+            [cur setNeedsLayout];
+            [cur layoutIfNeeded];
+            [cur.layer setNeedsDisplay];
+            [cur.layer displayIfNeeded];
+        } @catch (__unused NSException *e) {}
+        cur = cur.superview;
+    }
+}
+
+static BOOL qqeSetContentCacheText(UIView *tv, NSString *newText) {
+    if (!tv) return NO;
+    id tree = qqeObjectIvar(tv, "_treeContent");
+    id inter = tree ? qqeObjectIvar(tree, "_intermediatedata") : nil;
+    if (!tree || !inter) return NO;
+    id attr = qqeReadAttr(inter);
+    NSString *oldText = qqeAttrPlain(attr);
+    NSAttributedString *newAttr = qqeMakeReplacementAttr(attr, newText);
+    if (!newAttr) return NO;
+    SEL setSel = @selector(setAtrributedString:);
+    if (![inter respondsToSelector:setSel]) return NO;
+    @try { ((void (*)(id, SEL, id))objc_msgSend)(inter, setSel, newAttr); }
+    @catch (__unused NSException *e) { return NO; }
+    @try {
+        qqeClearDrawInfo(qqeObjectIvar(tree, "_normalDrawInfo"));
+        qqeClearDrawInfo(qqeObjectIvar(tree, "_editDrawInfo"));
+    } @catch (__unused NSException *e) {}
+    qqeForceRedraw(tv);
+    @try { qqeAdjustBubble(tv, newAttr, oldText, newText); } @catch (__unused NSException *e) {}
+    if (oldText.length && newText.length && ![oldText isEqualToString:newText]) {
+        qqeEditEnsureState();
+        BOOL chained = NO;
+        for (NSString *k in [gQQEEditsByOriginal allKeys]) {
+            if ([gQQEEditsByOriginal[k] isEqualToString:oldText]) { gQQEEditsByOriginal[k] = newText; chained = YES; break; }
+        }
+        if (!chained) gQQEEditsByOriginal[oldText] = newText;
+    }
+    return YES;
+}
+
+static void qqeApplyEdit(UIView *tv, NSString *original, NSString *newText) {
+    if (!tv || newText.length == 0) return;
+    if (newText.length > original.length) return;   // 只能缩减：字符数 ≤ 原文
+    @try { qqeSetContentCacheText(tv, newText); } @catch (__unused NSException *e) {}
+}
+
+static void qqeDismissMenuWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (qqeClassContains(w, @"AIOPopMenuWindow")) {
+                    @try { w.hidden = YES; [w resignKeyWindow]; } @catch (__unused NSException *e) {}
+                }
+            }
+        }
+    }
+}
+
+static void qqeShowEditAlert(UIView *tv, NSString *original) {
+    if (!tv) return;
+    UIWindow *win = activeForegroundWindow();
+    if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if (!top) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"本地编辑（仅本机显示）"
+                                                               message:@"只能删减字数，不能加长"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = original;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    __weak UIView *wtv = tv;
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *txt = ac.textFields.firstObject.text ?: @"";
+        qqeApplyEdit(wtv, original, txt);
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+static void qqeTriggerEdit(void) {
+    if (!pref_editText) return;
+    if (!gQQEEditCaptureOK || gQQEEditOriginal.length == 0) return;
+    UIView *tv = gQQEEditTextView;
+    if (!tv) return;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gQQEEditTriggerTs < 0.6) return;   // 去抖：tap 和 didSelect 只触发一次
+    gQQEEditTriggerTs = now;
+    NSString *original = [gQQEEditOriginal copy];
+    qqeDismissMenuWindow();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        qqeShowEditAlert(tv, original);
+    });
+}
+
+@interface QQEEditMenuHandler : NSObject
++ (instancetype)shared;
+- (void)qqeEditTapped:(id)sender;
+@end
+
+@implementation QQEEditMenuHandler
++ (instancetype)shared {
+    static QQEEditMenuHandler *s = nil; static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = [[QQEEditMenuHandler alloc] init]; });
+    return s;
+}
+- (void)qqeEditTapped:(id)sender { qqeTriggerEdit(); }
+@end
+
+static BOOL qqeEditMenuShouldInject(void) {
+    return gQQEEditCaptureOK && ([NSDate timeIntervalSinceReferenceDate] - gQQEEditCaptureTs < 5.0);
+}
+
+static void qqeDecorateEditCell(UIView *cell) {
+    if (!cell) return;
+    UILabel *label = (UILabel *)qqeFindFirstSubviewOfClass(cell, [UILabel class]);
+    if (label) label.text = @"编辑";
+    UIImageView *iv = (UIImageView *)qqeFindFirstSubviewOfClass(cell, [UIImageView class]);
+    if (iv) {
+        UIImage *img = nil;
+        if (@available(iOS 13.0, *)) { @try { img = [UIImage systemImageNamed:@"square.and.pencil"]; } @catch (__unused NSException *e) {} }
+        if (img) iv.image = img;
+    }
+    cell.userInteractionEnabled = YES;
+    UITapGestureRecognizer *old = objc_getAssociatedObject(cell, &kQQEEditTapKey);
+    if (old) { @try { [cell removeGestureRecognizer:old]; } @catch (__unused NSException *e) {} }
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[QQEEditMenuHandler shared] action:@selector(qqeEditTapped:)];
+    tap.cancelsTouchesInView = YES;
+    [cell addGestureRecognizer:tap];
+    objc_setAssociatedObject(cell, &kQQEEditTapKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// cell 滑出再滑回 / 复用重绑后，把编辑补回去。
+static void qqeReapplyEditsForCell(UIView *cell) {
+    if (!pref_editText) return;
+    qqeEditEnsureState();
+    if (gQQEEditsByOriginal.count == 0) return;
+    if (!qqeClassContains(cell, @"AIOContentCell")) return;
+    UIView *tv = qqeFindSubviewContains(cell, @"AIOTextView", 8);
+    if (!tv) return;
+    id tree = qqeObjectIvar(tv, "_treeContent");
+    id inter = tree ? qqeObjectIvar(tree, "_intermediatedata") : nil;
+    if (!tree || !inter) return;
+    id attr = qqeReadAttr(inter);
+    NSString *cur = qqeAttrPlain(attr);
+    if (cur.length == 0) return;
+
+    // ① 当前是某条原文 → 重新改成新文本
+    NSString *newForOriginal = gQQEEditsByOriginal[cur];
+    if (newForOriginal && ![newForOriginal isEqualToString:cur]) {
+        @try { qqeSetContentCacheText(tv, newForOriginal); } @catch (__unused NSException *e) {}
+        return;
+    }
+    // ② 当前已是某条新文本(文本对、frame 可能被还原) → 仅重缩气泡(qqeAdjustBubble 自带幂等守卫)
+    for (NSString *k in gQQEEditsByOriginal) {
+        NSString *nv = gQQEEditsByOriginal[k];
+        if ([nv isEqualToString:cur] && ![nv isEqualToString:k]) {
+            @try { qqeAdjustBubble(tv, (NSAttributedString *)attr, k, cur); } @catch (__unused NSException *e) {}
+            return;
+        }
+    }
+}
+
+static void qqe_AIOContentCell_bindViewModel(id cellSelf, SEL cmd, id vm) {
+    if (gQQEOrigAIOBindViewModel) ((void (*)(id, SEL, id))gQQEOrigAIOBindViewModel)(cellSelf, cmd, vm);
+    if (!pref_editText) return;
+    qqeEditEnsureState();
+    if (gQQEEditsByOriginal.count == 0) return;
+    UIView *cell = (UIView *)cellSelf;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try { qqeReapplyEditsForCell(cell); } @catch (__unused NSException *e) {}
+    });
+}
+
+static void qqeInstallEditReapplyHook(void) {
+    if (gQQEOrigAIOBindViewModel) return;
+    Class cls = objc_getClass("AIOLib.AIOContentCell");
+    if (!cls) return;
+    SEL sel = sel_registerName("bindViewModel:");
+    if (!class_getInstanceMethod(cls, sel)) return;
+    qqesignHookInstanceMethod(cls, sel, (IMP)qqe_AIOContentCell_bindViewModel, &gQQEOrigAIOBindViewModel);
+}
+
+%group QQEEditMenu
+
+%hook AIOMessageMenuController
+
+- (NSInteger)collectionView:(UICollectionView *)cv numberOfItemsInSection:(NSInteger)section {
+    NSInteger n = %orig;
+    if (!pref_editText) return n;
+    if (section != kQQEEditSection) return n;
+    if (!qqeEditMenuShouldInject()) { gQQEMenuEditRow = -1; return n; }
+    gQQEMenuEditRow = n;        // 新项插在末尾(row = 原生项数)
+    return n + 1;
+}
+
+- (id)collectionView:(UICollectionView *)cv cellForItemAtIndexPath:(NSIndexPath *)indexPath {
+    if (pref_editText && gQQEMenuEditRow >= 0 &&
+        indexPath.section == kQQEEditSection && indexPath.row == gQQEMenuEditRow) {
+        // 用 row=0 模板克隆，避免 Swift 用越界 row 索引 items 数组
+        NSIndexPath *tmpl = [NSIndexPath indexPathForRow:0 inSection:kQQEEditSection];
+        id cell = %orig(cv, tmpl);
+        @try { qqeDecorateEditCell((UIView *)cell); } @catch (__unused NSException *e) {}
+        return cell;
+    }
+    return %orig;
+}
+
+- (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    if (pref_editText && gQQEMenuEditRow >= 0 &&
+        indexPath.section == kQQEEditSection && indexPath.row == gQQEMenuEditRow) {
+        qqeTriggerEdit();
+        return;   // 不调 %orig：避免 Swift 用越界 row 索引 items 数组
+    }
+    %orig;
+}
+
+%end
+
+%end // %group QQEEditMenu
+
+static void qqeEditEnsureMenuHooks(void) {
+    if (gQQEEditMenuHooked) return;
+    if (!objc_getClass("AIOMessageMenuController")) return;   // AIO 未加载，下次再试
+    gQQEEditMenuHooked = YES;
+    %init(QQEEditMenu);
+}
+
+static void qqeCaptureLongPress(UILongPressGestureRecognizer *gr) {
+    qqeEditEnsureMenuHooks();      // 进了 AIO 才装菜单 hook
+    qqeInstallEditReapplyHook();   // 进了 AIO 才装重绑持久化 hook
+    gQQEEditCaptureOK = NO;
+    UIView *gv = gr.view;
+    if (!gv) return;
+    CGPoint p = [gr locationInView:gv];
+    UIView *pressed = [gv hitTest:p withEvent:nil];
+    if (!pressed) pressed = gv;
+    UIView *cell = qqeFindAncestorCell(pressed);
+    UIView *tv = qqeFindAIOTextView(pressed, cell);
+    if (!tv) return;
+    if (!qqeIsIncomingBubble(tv)) return;   // 自己消息 → 不出编辑项
+    NSString *original = qqeTextViewExtract(tv, NULL, NULL, NULL);
+    if (original.length == 0) return;
+    gQQEEditTextView = tv;
+    gQQEEditOriginal = [original copy];
+    gQQEEditCaptureTs = [NSDate timeIntervalSinceReferenceDate];
+    gQQEEditCaptureOK = YES;
+}
+
+%hook UILongPressGestureRecognizer
+
+- (void)setState:(UIGestureRecognizerState)state {
+    %orig;
+    if (state != UIGestureRecognizerStateBegan) return;
+    if (!pref_editText) return;
+    @try { qqeCaptureLongPress(self); } @catch (__unused NSException *e) {}
+}
+
+%end
+
+
 #pragma mark - 5. 设置入口
 // ─────────────────────────────────────────────
 
@@ -3051,7 +3511,6 @@ static void qqesign_installNetworkHooks(void) {
         loadPrefs();
         %init;
         %init(QZoneAdBlockLazyEntry);
-        NSLog(@"[QQESign] runtime log file: %@", qqesignRuntimeLogPath());
         qqesignInstallQZoneAdHooks("ctor");
         if (qqesignAnyTopSearchEnabled()) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -3060,12 +3519,5 @@ static void qqesign_installNetworkHooks(void) {
         }
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
-        NSLog(@"[QQESign] v2.4 Loaded (NT架构) antiRevoke=%d flashUnlimited=%d qzoneAd=%d topSearch(home=%d contact=%d dynamic=%d) fakeBatt=%d drawerHide=%d",
-              pref_antiRevoke, pref_flashUnlimited, pref_qzoneAdBlock,
-              pref_hideHomeSearch, pref_hideContactSearch, pref_hideDynamicSearch,
-              pref_fakeBattery,
-              (pref_drawerHideAlbum || pref_drawerHideFavorite || pref_drawerHideFiles ||
-               pref_drawerHideWallet || pref_drawerHideVip || pref_drawerHideDecor ||
-               pref_drawerHideFreedata));
     }
 }
