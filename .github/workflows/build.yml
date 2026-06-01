@@ -71,7 +71,7 @@ jobs:
             -dynamiclib \
             -install_name @rpath/QQESign.dylib \
             -framework UIKit -framework Foundation \
-            -framework CoreGraphics -framework Photos \
+            -framework CoreGraphics -framework QuartzCore -framework Photos \
             -o QQESign.dylib Tweak.x.m
 
           echo "Build succeeded"
