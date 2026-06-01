@@ -573,7 +573,7 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 }
 
 // 右侧电量百分比（可更新）
-- (UIView *)valueRowTitle:(NSString *)title valueOut:(UILabel **)out {
+- (UIView *)valueRowTitle:(NSString *)title valueOut:(UILabel * __strong *)out {
     UILabel *val = [[UILabel alloc] init];
     val.font = [UIFont systemFontOfSize:16];
     val.textColor = QQETextSecondary();
