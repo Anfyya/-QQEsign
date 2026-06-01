@@ -9,7 +9,7 @@ LIBRARY_NAME = QQESign
 
 QQESign_FILES = Tweak.x
 QQESign_CFLAGS = -fobjc-arc -DQQESIGN_SIDELOAD=1
-QQESign_FRAMEWORKS = UIKit Foundation CoreGraphics Photos
+QQESign_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore Photos
 QQESign_LDFLAGS = -install_name @rpath/QQESign.dylib
 
 include $(THEOS)/makefiles/library.mk
