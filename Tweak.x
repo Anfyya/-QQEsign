@@ -4079,7 +4079,7 @@ static void qqesign_installNetworkHooks(void) {
 //   标题和正文都为空 => 不弹（可用于「关掉」公告）。
 //
 // ★★★ 改成你自己的网址 ★★★
-#define QQE_ANNOUNCE_URL @"https://example.com/qqesign/announce.json"
+#define QQE_ANNOUNCE_URL @"https://qqnotify.my78.cyou"
 
 static void qqesignPresentAnnouncement(NSString *announceId, NSString *title, NSString *message, NSArray *buttons) {
     UIWindow *win = activeForegroundWindow();
