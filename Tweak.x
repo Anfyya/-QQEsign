@@ -431,7 +431,6 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 @implementation QQESignSettingsController {
     UIScrollView *_scroll;
     UIStackView  *_content;
-    UIView       *_titleView;        // 导航栏内联两行标题（滚动后淡入）
     QQEBatterySlider *_batterySlider;
     UILabel *_batteryRowValue;
     UILabel *_batteryHeadValue;
@@ -442,10 +441,11 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    // 不用系统单行大标题；标题改为自绘两行（大标题块 + 滚动后淡入的内联标题）
-    self.navigationController.navigationBar.prefersLargeTitles = NO;
-    self.navigationItem.titleView = [self buildNavTitleView];
-    _titleView.alpha = 0;   // 顶部隐藏，滚动后淡入
+    // 标题交给系统大标题机制：自动处理状态栏/导航栏 inset、滚动折叠、
+    // 顶部透明→滚动磨砂的切换。彻底避开手搓 titleView 与安全区打架导致的顶栏错位。
+    self.title = @"QQESign";
+    self.navigationController.navigationBar.prefersLargeTitles = YES;
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
 
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"完成"
@@ -454,15 +454,26 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
                                         action:@selector(dismissSelf)];
     self.navigationItem.rightBarButtonItem.tintColor = QQEBlue();
 
-    // 导航栏：顶部透明、滚动后毛玻璃
     if (@available(iOS 13.0, *)) {
         UINavigationBar *bar = self.navigationController.navigationBar;
         bar.tintColor = QQEBlue();
+
+        NSDictionary *titleAttrs      = @{ NSForegroundColorAttributeName: QQETextPrimary() };
+        NSDictionary *largeTitleAttrs = @{ NSForegroundColorAttributeName: QQETextPrimary() };
+
+        // 滚动到顶：透明，露出壁纸 + 大标题
         UINavigationBarAppearance *edge = [[UINavigationBarAppearance alloc] init];
         [edge configureWithTransparentBackground];
-        bar.scrollEdgeAppearance = edge;
+        edge.titleTextAttributes = titleAttrs;
+        edge.largeTitleTextAttributes = largeTitleAttrs;
+
+        // 向上滚动后：系统毛玻璃（自动切换，无需手动监听）
         UINavigationBarAppearance *std = [[UINavigationBarAppearance alloc] init];
         [std configureWithDefaultBackground];
+        std.titleTextAttributes = titleAttrs;
+        std.largeTitleTextAttributes = largeTitleAttrs;
+
+        bar.scrollEdgeAppearance = edge;
         bar.standardAppearance = std;
         bar.compactAppearance = std;
     }
@@ -508,37 +519,12 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
     [self refreshBatteryEnabledState];
 }
 
-// 滚动后让内联标题淡入（模拟大标题折叠）
-- (void)scrollViewDidScroll:(UIScrollView *)sv {
-    CGFloat top = sv.contentOffset.y + sv.adjustedContentInset.top;
-    _titleView.alpha = top > 24 ? 1.0 : 0.0;
-}
+// 标题折叠/淡入由系统大标题机制自动处理，无需手动监听滚动。
 
-// 导航栏内联两行标题：QQESign / @Yjln
-- (UIView *)buildNavTitleView {
-    UILabel *main = [[UILabel alloc] init];
-    main.text = @"QQESign";
-    main.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    main.textColor = QQETextPrimary();
-    main.textAlignment = NSTextAlignmentCenter;
-
-    UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"@Yjln";
-    sub.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightMedium];
-    sub.textColor = QQETextSecondary();
-    sub.textAlignment = NSTextAlignmentCenter;
-
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[main, sub]];
-    st.axis = UILayoutConstraintAxisVertical;
-    st.alignment = UIStackViewAlignmentCenter;
-    st.spacing = 1;
-    _titleView = st;
-    return st;
-}
 
 // ── 构建全部内容 ─────────────────────────────────────────────
 - (void)buildContent {
-    // 大标题块（两行）：QQESign / @Yjln
+    // 副标题 @Yjln（紧贴系统大标题下方；大标题「QQESign」由导航栏渲染）
     [_content addArrangedSubview:[self largeTitleBlock]];
 
     // 1. 消息防撤回
@@ -600,21 +586,16 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 }
 
 - (UIView *)largeTitleBlock {
-    UILabel *main = [[UILabel alloc] init];
-    main.text = @"QQESign";
-    main.font = [UIFont systemFontOfSize:32 weight:UIFontWeightBold];
-    main.textColor = QQETextPrimary();
-
     UILabel *sub = [[UILabel alloc] init];
     sub.text = @"@Yjln";
     sub.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     sub.textColor = QQETextSecondary();
 
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[main, sub]];
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[sub]];
     st.axis = UILayoutConstraintAxisVertical;
-    st.spacing = 3;
     st.layoutMarginsRelativeArrangement = YES;
-    st.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(2, 20, 6, 20);
+    // 紧贴系统大标题正下方；负上边距把它往上收一点
+    st.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(-2, 20, 10, 20);
     return st;
 }
 
@@ -848,7 +829,8 @@ static void showQQESignSettings(void) {
 
         QQESignSettingsController *vc = [[QQESignSettingsController alloc] init];
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-        nav.modalPresentationStyle = UIModalPresentationFormSheet;
+        // 全屏呈现：状态栏可见的完整设置页（而非 iPhone 上挤在卡片顶部的半屏 FormSheet）
+        nav.modalPresentationStyle = UIModalPresentationFullScreen;
         [root presentViewController:nav animated:YES completion:nil];
     });
 }
