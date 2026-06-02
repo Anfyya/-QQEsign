@@ -431,6 +431,11 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 @implementation QQESignSettingsController {
     UIScrollView *_scroll;
     UIStackView  *_content;
+    UIView       *_topBar;          // 自定义顶栏容器（覆盖在内容之上）
+    UIVisualEffectView *_topBarBlur;// 顶栏磨砂背景（滚动时淡入）
+    UIView       *_topBarHairline;  // 顶栏底部细分隔线
+    UILabel      *_collapsedTitle;  // 折叠后的小标题 QQESign（滚动时淡入）
+    CGFloat      _topBarHeight;     // 状态栏 + 44 行
     QQEBatterySlider *_batterySlider;
     UILabel *_batteryRowValue;
     UILabel *_batteryHeadValue;
@@ -441,54 +446,20 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    // 标题交给系统大标题机制：自动处理状态栏/导航栏 inset、滚动折叠、
-    // 顶部透明→滚动磨砂的切换。彻底避开手搓 titleView 与安全区打架导致的顶栏错位。
-    self.title = @"QQESign";
-    self.navigationController.navigationBar.prefersLargeTitles = YES;
-    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
+    self.view.backgroundColor = [UIColor blackColor]; // 兜底，避免任何白底闪现
 
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"完成"
-                                         style:UIBarButtonItemStyleDone
-                                        target:self
-                                        action:@selector(dismissSelf)];
-    self.navigationItem.rightBarButtonItem.tintColor = QQEBlue();
-
-    if (@available(iOS 13.0, *)) {
-        UINavigationBar *bar = self.navigationController.navigationBar;
-        bar.tintColor = QQEBlue();
-
-        NSDictionary *titleAttrs      = @{ NSForegroundColorAttributeName: QQETextPrimary() };
-        NSDictionary *largeTitleAttrs = @{ NSForegroundColorAttributeName: QQETextPrimary() };
-
-        // 滚动到顶：透明，露出壁纸 + 大标题
-        UINavigationBarAppearance *edge = [[UINavigationBarAppearance alloc] init];
-        [edge configureWithTransparentBackground];
-        edge.titleTextAttributes = titleAttrs;
-        edge.largeTitleTextAttributes = largeTitleAttrs;
-
-        // 向上滚动后：系统毛玻璃（自动切换，无需手动监听）
-        UINavigationBarAppearance *std = [[UINavigationBarAppearance alloc] init];
-        [std configureWithDefaultBackground];
-        std.titleTextAttributes = titleAttrs;
-        std.largeTitleTextAttributes = largeTitleAttrs;
-
-        bar.scrollEdgeAppearance = edge;
-        bar.standardAppearance = std;
-        bar.compactAppearance = std;
-    }
-
-    // 背景壁纸
+    // 背景壁纸（全屏铺满，包括状态栏与顶栏后面 —— 不再有割裂的白框）
     QQEWallpaperView *wall = [[QQEWallpaperView alloc] init];
     wall.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:wall];
 
-    // 滚动容器
+    // 滚动容器（自己完全控制顶部 inset，不交给系统）
     _scroll = [[UIScrollView alloc] init];
     _scroll.translatesAutoresizingMaskIntoConstraints = NO;
     _scroll.backgroundColor = [UIColor clearColor];
     _scroll.alwaysBounceVertical = YES;
     _scroll.showsVerticalScrollIndicator = NO;
+    _scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     _scroll.delegate = self;
     [self.view addSubview:_scroll];
 
@@ -509,22 +480,118 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
         [_scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
 
-        [_content.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor constant:8],
+        [_content.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor],
         [_content.bottomAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.bottomAnchor constant:-28],
         [_content.leadingAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.leadingAnchor],
         [_content.trailingAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.trailingAnchor],
     ]];
 
     [self buildContent];
+    [self buildTopBar];        // 顶栏最后加，保证盖在内容之上
     [self refreshBatteryEnabledState];
 }
 
-// 标题折叠/淡入由系统大标题机制自动处理，无需手动监听滚动。
+// 自定义顶栏：透明覆盖层，滚动时淡入磨砂 + 折叠小标题
+- (void)buildTopBar {
+    _topBar = [[UIView alloc] init];
+    _topBar.translatesAutoresizingMaskIntoConstraints = NO;
+    _topBar.userInteractionEnabled = NO;   // 不拦截触摸：顶栏空白区也能拖动滚动
+    [self.view addSubview:_topBar];
 
+    UIBlurEffect *fx;
+    if (@available(iOS 13.0, *)) fx = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial];
+    else fx = [UIBlurEffect effectWithStyle:UIBlurEffectStyleLight];
+    _topBarBlur = [[UIVisualEffectView alloc] initWithEffect:fx];
+    _topBarBlur.translatesAutoresizingMaskIntoConstraints = NO;
+    _topBarBlur.alpha = 0.0;               // 顶部透明，滚动后淡入
+    [_topBar addSubview:_topBarBlur];
+
+    _topBarHairline = [[UIView alloc] init];
+    _topBarHairline.translatesAutoresizingMaskIntoConstraints = NO;
+    _topBarHairline.backgroundColor = QQESeparator();
+    _topBarHairline.alpha = 0.0;
+    [_topBar addSubview:_topBarHairline];
+
+    // 折叠小标题 QQESign（居中，滚动后淡入）
+    _collapsedTitle = [[UILabel alloc] init];
+    _collapsedTitle.text = @"QQESign";
+    _collapsedTitle.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    _collapsedTitle.textColor = QQETextPrimary();
+    _collapsedTitle.textAlignment = NSTextAlignmentCenter;
+    _collapsedTitle.alpha = 0.0;
+    _collapsedTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [_topBar addSubview:_collapsedTitle];
+
+    // 完成按钮（单独挂在 view 上，始终可点；右上）
+    UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem];
+    [done setTitle:@"完成" forState:UIControlStateNormal];
+    [done setTitleColor:QQEBlue() forState:UIControlStateNormal];
+    done.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    [done addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
+    done.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:done];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_topBar.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_topBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_topBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_topBar.bottomAnchor constraintEqualToAnchor:safe.topAnchor constant:44],
+
+        [_topBarBlur.topAnchor constraintEqualToAnchor:_topBar.topAnchor],
+        [_topBarBlur.bottomAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
+        [_topBarBlur.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor],
+        [_topBarBlur.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor],
+
+        [_topBarHairline.bottomAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
+        [_topBarHairline.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor],
+        [_topBarHairline.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor],
+        [_topBarHairline.heightAnchor constraintEqualToConstant:0.5],
+
+        [_collapsedTitle.centerXAnchor constraintEqualToAnchor:_topBar.centerXAnchor],
+        [_collapsedTitle.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_collapsedTitle.bottomAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
+
+        [done.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [done.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [done.heightAnchor constraintEqualToConstant:44],
+    ]];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // 顶栏总高 = 状态栏安全区 + 44pt 行；据此设置滚动内容的顶部留白
+    CGFloat barH = self.view.safeAreaInsets.top + 44.0;
+    if (fabs(_topBarHeight - barH) > 0.5) {
+        _topBarHeight = barH;
+        UIEdgeInsets ins = _scroll.contentInset;
+        ins.top = barH;
+        _scroll.contentInset = ins;
+        UIEdgeInsets si = _scroll.verticalScrollIndicatorInsets;
+        si.top = barH;
+        _scroll.verticalScrollIndicatorInsets = si;
+        if (_scroll.contentOffset.y == 0 || _scroll.contentOffset.y == -_scroll.adjustedContentInset.top) {
+            _scroll.contentOffset = CGPointMake(0, -barH);
+        }
+    }
+}
+
+// 状态栏样式跟随明暗（自动）
+- (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleDefault; }
+
+// 滚动：驱动顶栏磨砂 + 折叠标题淡入（纯本地视图，无系统导航栏延迟）
+- (void)scrollViewDidScroll:(UIScrollView *)sv {
+    CGFloat y = sv.contentOffset.y + _topBarHeight;   // 0 = 顶部
+    CGFloat p = y / 44.0;                              // 0..1 过渡进度
+    p = MAX(0.0, MIN(1.0, p));
+    _topBarBlur.alpha = p;
+    _topBarHairline.alpha = p;
+    _collapsedTitle.alpha = p * p;                    // 稍晚淡入，更接近系统观感
+}
 
 // ── 构建全部内容 ─────────────────────────────────────────────
 - (void)buildContent {
-    // 副标题 @Yjln（紧贴系统大标题下方；大标题「QQESign」由导航栏渲染）
+    // 大标题块：QQESign（大号）+ @Yjln（小号）—— 随内容滚动，上滑后折叠进顶栏
     [_content addArrangedSubview:[self largeTitleBlock]];
 
     // 1. 消息防撤回
@@ -586,16 +653,22 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 }
 
 - (UIView *)largeTitleBlock {
+    UILabel *main = [[UILabel alloc] init];
+    main.text = @"QQESign";
+    main.font = [UIFont systemFontOfSize:34 weight:UIFontWeightBold];
+    main.textColor = QQETextPrimary();
+
     UILabel *sub = [[UILabel alloc] init];
     sub.text = @"@Yjln";
     sub.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     sub.textColor = QQETextSecondary();
 
-    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[sub]];
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[main, sub]];
     st.axis = UILayoutConstraintAxisVertical;
+    st.spacing = 3;
     st.layoutMarginsRelativeArrangement = YES;
-    // 紧贴系统大标题正下方；负上边距把它往上收一点
-    st.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(-2, 20, 10, 20);
+    // 顶部留 10pt（紧贴顶栏行下方），底部 6pt 接第一个分区
+    st.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(10, 20, 6, 20);
     return st;
 }
 
@@ -828,10 +901,10 @@ static void showQQESignSettings(void) {
         while (root.presentedViewController) root = root.presentedViewController;
 
         QQESignSettingsController *vc = [[QQESignSettingsController alloc] init];
-        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-        // 全屏呈现：状态栏可见的完整设置页（而非 iPhone 上挤在卡片顶部的半屏 FormSheet）
-        nav.modalPresentationStyle = UIModalPresentationFullScreen;
-        [root presentViewController:nav animated:YES completion:nil];
+        // 自定义顶栏，无需系统导航栏：直接全屏呈现（壁纸铺满，无白框、无标题栏延迟）
+        vc.modalPresentationStyle = UIModalPresentationFullScreen;
+        vc.modalPresentationCapturesStatusBarAppearance = YES;
+        [root presentViewController:vc animated:YES completion:nil];
     });
 }
 
