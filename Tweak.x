@@ -579,14 +579,11 @@ static UIColor *QQESeparator(void)     { return [UIColor separatorColor]; }
 // 状态栏样式跟随明暗（自动）
 - (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleDefault; }
 
-// 滚动：驱动顶栏磨砂 + 折叠标题淡入（纯本地视图，无系统导航栏延迟）
+// 顶栏始终透明：上滑也不出现磨砂白条 / 折叠标题，保持沉浸式（与未滚动时一致）
 - (void)scrollViewDidScroll:(UIScrollView *)sv {
-    CGFloat y = sv.contentOffset.y + _topBarHeight;   // 0 = 顶部
-    CGFloat p = y / 44.0;                              // 0..1 过渡进度
-    p = MAX(0.0, MIN(1.0, p));
-    _topBarBlur.alpha = p;
-    _topBarHairline.alpha = p;
-    _collapsedTitle.alpha = p * p;                    // 稍晚淡入，更接近系统观感
+    _topBarBlur.alpha = 0.0;
+    _topBarHairline.alpha = 0.0;
+    _collapsedTitle.alpha = 0.0;
 }
 
 // ── 构建全部内容 ─────────────────────────────────────────────
