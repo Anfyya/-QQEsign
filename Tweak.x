@@ -4060,6 +4060,102 @@ static void qqesign_installNetworkHooks(void) {
 }
 
 // ─────────────────────────────────────────────
+#pragma mark - 7. 启动公告 (远程弹窗，系统样式)
+// ─────────────────────────────────────────────
+//
+// QQ 启动后拉取下面的 URL，按返回的 id 去重（同一条只弹一次），
+// 用系统 UIAlertController 弹一次。服务器端随时改内容 / 换 id 即可。
+//
+// 服务器返回 JSON（建议 HTTPS）：
+//   {
+//     "id": "2026-06-02-1",          // 去重键；改了它才会重新弹。缺省则用 标题+正文 的哈希
+//     "title": "标题",
+//     "message": "正文",
+//     "buttons": [                    // 可选；缺省给一个「确定」
+//       { "text": "知道了", "style": "cancel" },
+//       { "text": "查看",   "style": "default", "url": "https://..." }
+//     ]
+//   }
+//   标题和正文都为空 => 不弹（可用于「关掉」公告）。
+//
+// ★★★ 改成你自己的网址 ★★★
+#define QQE_ANNOUNCE_URL @"https://example.com/qqesign/announce.json"
+
+static void qqesignPresentAnnouncement(NSString *announceId, NSString *title, NSString *message, NSArray *buttons) {
+    UIWindow *win = activeForegroundWindow();
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if (!top) return; // 窗口还没就绪：本次放弃，不记 id，下次启动再试
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:(title.length ? title : nil)
+                                                                  message:(message.length ? message : nil)
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    if (buttons.count == 0) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+    } else {
+        for (id b in buttons) {
+            if (![b isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *bd = (NSDictionary *)b;
+            NSString *text = [bd[@"text"] isKindOfClass:[NSString class]] ? bd[@"text"] : @"确定";
+            if (text.length == 0) text = @"确定";
+            NSString *styleStr = [bd[@"style"] isKindOfClass:[NSString class]] ? bd[@"style"] : nil;
+            UIAlertActionStyle style = UIAlertActionStyleDefault;
+            if ([styleStr isEqualToString:@"cancel"])           style = UIAlertActionStyleCancel;
+            else if ([styleStr isEqualToString:@"destructive"]) style = UIAlertActionStyleDestructive;
+            NSString *urlStr = [bd[@"url"] isKindOfClass:[NSString class]] ? bd[@"url"] : nil;
+            [alert addAction:[UIAlertAction actionWithTitle:text style:style handler:^(UIAlertAction *a) {
+                if (urlStr.length) {
+                    NSURL *u = [NSURL URLWithString:urlStr];
+                    if (u) [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+                }
+            }]];
+        }
+    }
+
+    [top presentViewController:alert animated:YES completion:^{
+        // 成功弹出后才记 id，避免「标记已读但其实没看到」
+        [tweakDefaults() setObject:announceId forKey:@"lastAnnounceId"];
+        [tweakDefaults() synchronize];
+    }];
+}
+
+static void qqesignFetchLaunchAnnouncement(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSURL *url = [NSURL URLWithString:QQE_ANNOUNCE_URL];
+        if (!url) return;
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                          cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                      timeoutInterval:8.0];
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+            completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+                if (err || data.length == 0) return;
+                id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if (![obj isKindOfClass:[NSDictionary class]]) return;
+                NSDictionary *json = (NSDictionary *)obj;
+
+                NSString *title   = [json[@"title"]   isKindOfClass:[NSString class]] ? json[@"title"]   : @"";
+                NSString *message = [json[@"message"] isKindOfClass:[NSString class]] ? json[@"message"] : @"";
+                if (title.length == 0 && message.length == 0) return; // 空内容 => 不弹
+
+                NSString *announceId = [json[@"id"] isKindOfClass:[NSString class]] ? json[@"id"] : nil;
+                if (announceId.length == 0) {
+                    announceId = [NSString stringWithFormat:@"h%lu",
+                                  (unsigned long)[[title stringByAppendingString:message] hash]];
+                }
+                NSString *last = [tweakDefaults() stringForKey:@"lastAnnounceId"];
+                if ([announceId isEqualToString:last]) return; // 同一条已弹过，跳过
+
+                NSArray *buttons = [json[@"buttons"] isKindOfClass:[NSArray class]] ? json[@"buttons"] : nil;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    qqesignPresentAnnouncement(announceId, title, message, buttons);
+                });
+            }];
+        [task resume];
+    });
+}
+
+// ─────────────────────────────────────────────
 #pragma mark - Constructor
 // ─────────────────────────────────────────────
 
@@ -4076,5 +4172,8 @@ static void qqesign_installNetworkHooks(void) {
         }
         qqesignInstallRecallHooksWithRetry();
         qqesign_installNetworkHooks(); // ★ 网络层SSLRead拦截
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            qqesignFetchLaunchAnnouncement(); // ★ 启动公告（远程弹窗）
+        });
     }
 }
